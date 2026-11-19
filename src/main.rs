@@ -3,8 +3,9 @@
 mod engine;
 
 use engine::{
-    extract_embedded_data_to_dir, vk_to_us_char, CorrectionMode, Language, NotificationBanner,
-    PendingOsReplacement, RightLangEngine, APP_AUTHOR, APP_BRAND_NAME,
+    extract_embedded_data_to_dir, reconcile_replacement_queue, us_to_thai_char, vk_to_us_char,
+    CorrectionMode, DeferredKey, Language, NotificationBanner, PendingOsReplacement,
+    RightLangEngine, APP_AUTHOR, APP_BRAND_NAME,
 };
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -58,12 +59,24 @@ const ICON_48_BGRA: &[u8] = include_bytes!("../assets/icon_48.bgra");
 const ICON_64_BGRA: &[u8] = include_bytes!("../assets/icon_64.bgra");
 
 static IS_INJECTING: AtomicBool = AtomicBool::new(false);
+static DEFER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static DEFER_ABORTED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_BUF_SC: AtomicU8 = AtomicU8::new(0);
 static ACTIVE_SEL_SC: AtomicU8 = AtomicU8::new(0);
 static MAIN_HWND: Mutex<usize> = Mutex::new(0);
 static TOAST_HWND: Mutex<usize> = Mutex::new(0);
 static HOOK_SENDER: Mutex<Option<Sender<HookEvent>>> = Mutex::new(None);
 static GLOBAL_APP_STATE: Mutex<Option<Arc<Mutex<AppUiState>>>> = Mutex::new(None);
+static DEFERRED_KEYS: Mutex<Vec<(DeferredKey, usize)>> = Mutex::new(Vec::new());
+
+struct InjectionGuard;
+
+impl Drop for InjectionGuard {
+    fn drop(&mut self) {
+        DEFER_ACTIVE.store(false, Ordering::SeqCst);
+        IS_INJECTING.store(false, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ConfigDraft {
@@ -2262,9 +2275,10 @@ unsafe fn switch_windows_input_language(hwnd: HWND, target_lang: Language) {
     if !hwnd.is_null() && hwnd != focus {
         PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, target_hkl);
     }
-    for _ in 0..6 {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(8));
         if detect_window_input_language(hwnd) == target_lang {
+            std::thread::sleep(std::time::Duration::from_millis(8));
             return;
         }
     }
@@ -2338,61 +2352,38 @@ unsafe fn switch_windows_input_language(hwnd: HWND, target_lang: Language) {
             toggle_inputs.as_mut_ptr(),
             std::mem::size_of::<INPUT>() as i32,
         );
-        for _ in 0..5 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_millis(8));
             if detect_window_input_language(hwnd) == target_lang {
+                std::thread::sleep(std::time::Duration::from_millis(8));
                 return;
             }
         }
     }
 }
 
-unsafe fn execute_os_replacement(hwnd: HWND, rep: &PendingOsReplacement) {
-    IS_INJECTING.store(true, Ordering::SeqCst);
+unsafe fn send_vk_key(vk: u16) {
+    let scan = MapVirtualKeyW(vk as u32, 0) as u16;
+    let mut down: INPUT = std::mem::zeroed();
+    down.type_ = INPUT_KEYBOARD;
+    down.u.ki_mut().wVk = vk;
+    down.u.ki_mut().wScan = scan;
+    SendInput(1, &mut down, std::mem::size_of::<INPUT>() as i32);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let mut up: INPUT = std::mem::zeroed();
+    up.type_ = INPUT_KEYBOARD;
+    up.u.ki_mut().wVk = vk;
+    up.u.ki_mut().wScan = scan;
+    up.u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &mut up, std::mem::size_of::<INPUT>() as i32);
+}
 
-    std::thread::sleep(std::time::Duration::from_millis(15));
-
-    let mut inputs: Vec<INPUT> = Vec::with_capacity(rep.backspaces * 2 + 8);
-    for vk_mod in [
-        VK_LSHIFT,
-        VK_RSHIFT,
-        VK_SHIFT,
-        VK_LCONTROL,
-        VK_RCONTROL,
-        VK_CONTROL,
-    ] {
-        if (GetAsyncKeyState(vk_mod) as u16 & 0x8000) != 0 {
-            let mut up: INPUT = std::mem::zeroed();
-            up.type_ = INPUT_KEYBOARD;
-            up.u.ki_mut().wVk = vk_mod as u16;
-            up.u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
-            inputs.push(up);
-        }
+unsafe fn send_unicode_text(text: &str) {
+    if text.is_empty() {
+        return;
     }
-    for _ in 0..rep.backspaces {
-        let mut down: INPUT = std::mem::zeroed();
-        down.type_ = INPUT_KEYBOARD;
-        down.u.ki_mut().wVk = VK_BACK as u16;
-        inputs.push(down);
-
-        let mut up: INPUT = std::mem::zeroed();
-        up.type_ = INPUT_KEYBOARD;
-        up.u.ki_mut().wVk = VK_BACK as u16;
-        up.u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
-        inputs.push(up);
-    }
-    if !inputs.is_empty() {
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_mut_ptr(),
-            std::mem::size_of::<INPUT>() as i32,
-        );
-    }
-
-    switch_windows_input_language(hwnd, rep.target_lang);
-
-    let mut text_inputs: Vec<INPUT> = Vec::with_capacity(rep.replacement_text.len() * 2);
-    for u16_unit in rep.replacement_text.encode_utf16() {
+    let mut text_inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 2);
+    for u16_unit in text.encode_utf16() {
         let mut down: INPUT = std::mem::zeroed();
         down.type_ = INPUT_KEYBOARD;
         down.u.ki_mut().wScan = u16_unit;
@@ -2412,9 +2403,261 @@ unsafe fn execute_os_replacement(hwnd: HWND, rep: &PendingOsReplacement) {
             std::mem::size_of::<INPUT>() as i32,
         );
     }
+}
 
-    std::thread::sleep(std::time::Duration::from_millis(12));
-    IS_INJECTING.store(false, Ordering::SeqCst);
+unsafe fn replay_deferred_items(
+    items: &[(DeferredKey, usize)],
+    target_lang: Language,
+    expected_hwnd: usize,
+    worker_state: &Arc<Mutex<AppUiState>>,
+) -> bool {
+    if items.is_empty() {
+        return true;
+    }
+    let mut pending_text = String::with_capacity(items.len());
+    let mut fed_count = 0usize;
+    let mut all_same_window = true;
+
+    for &(dk, ev_hwnd) in items {
+        if ev_hwnd != expected_hwnd {
+            all_same_window = false;
+            break;
+        }
+        match dk {
+            DeferredKey::Printable(ch) => {
+                let mapped = if target_lang == Language::Thai {
+                    us_to_thai_char(ch)
+                } else {
+                    ch
+                };
+                pending_text.push(mapped);
+            }
+            DeferredKey::Boundary(ch) => {
+                if !pending_text.is_empty() {
+                    send_unicode_text(&pending_text);
+                    pending_text.clear();
+                }
+                let vk = match ch {
+                    '\n' => VK_RETURN as u16,
+                    '\t' => VK_TAB as u16,
+                    _ => VK_SPACE as u16,
+                };
+                send_vk_key(vk);
+            }
+            DeferredKey::Backspace => {
+                if !pending_text.is_empty() {
+                    send_unicode_text(&pending_text);
+                    pending_text.clear();
+                }
+                send_vk_key(VK_BACK as u16);
+            }
+        }
+        fed_count += 1;
+    }
+    if !pending_text.is_empty() {
+        send_unicode_text(&pending_text);
+    }
+
+    if fed_count > 0 {
+        if let Ok(mut st) = worker_state.lock() {
+            st.engine.active_language = target_lang;
+            for &(dk, _) in &items[..fed_count] {
+                match dk {
+                    DeferredKey::Printable(ch) | DeferredKey::Boundary(ch) => {
+                        let _ = st.engine.process_keystroke(ch);
+                    }
+                    DeferredKey::Backspace => {
+                        st.engine.handle_backspace();
+                    }
+                }
+            }
+        }
+    }
+
+    all_same_window
+}
+
+unsafe fn execute_os_replacement(
+    hwnd: HWND,
+    rep: &PendingOsReplacement,
+    rx: &mpsc::Receiver<HookEvent>,
+    worker_state: &Arc<Mutex<AppUiState>>,
+    expected_hwnd: usize,
+    extra_backspaces: usize,
+) -> Option<Language> {
+    DEFER_ABORTED.store(false, Ordering::SeqCst);
+    if let Ok(mut q) = DEFERRED_KEYS.lock() {
+        q.clear();
+    }
+    IS_INJECTING.store(true, Ordering::SeqCst);
+    DEFER_ACTIVE.store(true, Ordering::SeqCst);
+    let _guard = InjectionGuard;
+
+    std::thread::sleep(std::time::Duration::from_millis(25));
+
+    let mut leaked: Vec<DeferredKey> = Vec::new();
+    let mut aborted = DEFER_ABORTED.load(Ordering::Acquire);
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            HookEvent::PrintableKey { us_char, hwnd: ev_h } => {
+                if ev_h != expected_hwnd {
+                    aborted = true;
+                } else {
+                    leaked.push(DeferredKey::Printable(us_char));
+                }
+            }
+            HookEvent::Boundary { ch, hwnd: ev_h } => {
+                if ev_h != expected_hwnd {
+                    aborted = true;
+                } else {
+                    leaked.push(DeferredKey::Boundary(ch));
+                }
+            }
+            HookEvent::Backspace => {
+                leaked.push(DeferredKey::Backspace);
+            }
+            HookEvent::ClearBuffer
+            | HookEvent::SwitchBufferShortcut { .. }
+            | HookEvent::SwitchSelectedShortcut { .. } => {
+                aborted = true;
+            }
+            HookEvent::ToggleMode => {
+                if let Ok(mut st) = worker_state.lock() {
+                    st.engine.toggle_online_offline_mode();
+                }
+            }
+        }
+    }
+
+    let plan = reconcile_replacement_queue(rep, &leaked);
+    if aborted
+        || plan.aborted
+        || DEFER_ABORTED.load(Ordering::Acquire)
+        || (GetForegroundWindow() as usize) != expected_hwnd
+    {
+        if let Ok(mut st) = worker_state.lock() {
+            st.engine.reset_all_buffers();
+        }
+        let drained_abort = if let Ok(mut q) = DEFERRED_KEYS.lock() {
+            let v = std::mem::take(&mut *q);
+            IS_INJECTING.store(false, Ordering::SeqCst);
+            DEFER_ACTIVE.store(false, Ordering::SeqCst);
+            v
+        } else {
+            IS_INJECTING.store(false, Ordering::SeqCst);
+            DEFER_ACTIVE.store(false, Ordering::SeqCst);
+            Vec::new()
+        };
+        if !drained_abort.is_empty() {
+            let curr_fg = GetForegroundWindow();
+            let curr_lang = detect_window_input_language(curr_fg);
+            replay_deferred_items(&drained_abort, curr_lang, curr_fg as usize, worker_state);
+        }
+        return None;
+    }
+
+    let mut mod_inputs: Vec<INPUT> = Vec::with_capacity(6);
+    for vk_mod in [
+        VK_LSHIFT,
+        VK_RSHIFT,
+        VK_SHIFT,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_CONTROL,
+    ] {
+        if (GetAsyncKeyState(vk_mod) as u16 & 0x8000) != 0 {
+            let mut up: INPUT = std::mem::zeroed();
+            up.type_ = INPUT_KEYBOARD;
+            up.u.ki_mut().wVk = vk_mod as u16;
+            up.u.ki_mut().wScan = MapVirtualKeyW(vk_mod as u32, 0) as u16;
+            up.u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
+            mod_inputs.push(up);
+        }
+    }
+    if !mod_inputs.is_empty() {
+        SendInput(
+            mod_inputs.len() as u32,
+            mod_inputs.as_mut_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let os_backspaces = plan.backspaces + extra_backspaces;
+    for i in 0..os_backspaces {
+        send_vk_key(VK_BACK as u16);
+        if i + 1 < os_backspaces {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    if os_backspaces > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+
+    switch_windows_input_language(hwnd, rep.target_lang);
+    send_unicode_text(&plan.base_text);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    if !plan.replay_keys.is_empty() {
+        let replay_pairs: Vec<(DeferredKey, usize)> = plan
+            .replay_keys
+            .iter()
+            .map(|&k| (k, expected_hwnd))
+            .collect();
+        replay_deferred_items(&replay_pairs, rep.target_lang, expected_hwnd, worker_state);
+    }
+
+    for pass in 0..16 {
+        if pass > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(6));
+        }
+        if DEFER_ABORTED.load(Ordering::Acquire) || (GetForegroundWindow() as usize) != expected_hwnd
+        {
+            let leftover = if let Ok(mut q) = DEFERRED_KEYS.lock() {
+                let v = std::mem::take(&mut *q);
+                IS_INJECTING.store(false, Ordering::SeqCst);
+                DEFER_ACTIVE.store(false, Ordering::SeqCst);
+                v
+            } else {
+                IS_INJECTING.store(false, Ordering::SeqCst);
+                DEFER_ACTIVE.store(false, Ordering::SeqCst);
+                Vec::new()
+            };
+            if !leftover.is_empty() {
+                let curr_fg = GetForegroundWindow();
+                let curr_lang = detect_window_input_language(curr_fg);
+                replay_deferred_items(&leftover, curr_lang, curr_fg as usize, worker_state);
+            }
+            break;
+        }
+        let batch = if let Ok(mut q) = DEFERRED_KEYS.lock() {
+            if q.is_empty() {
+                IS_INJECTING.store(false, Ordering::SeqCst);
+                DEFER_ACTIVE.store(false, Ordering::SeqCst);
+                break;
+            }
+            let b = std::mem::take(&mut *q);
+            if pass == 15 {
+                IS_INJECTING.store(false, Ordering::SeqCst);
+                DEFER_ACTIVE.store(false, Ordering::SeqCst);
+            }
+            b
+        } else {
+            break;
+        };
+        if !replay_deferred_items(&batch, rep.target_lang, expected_hwnd, worker_state) {
+            if let Ok(mut q) = DEFERRED_KEYS.lock() {
+                q.clear();
+                IS_INJECTING.store(false, Ordering::SeqCst);
+                DEFER_ACTIVE.store(false, Ordering::SeqCst);
+            }
+            break;
+        }
+        if pass == 15 {
+            break;
+        }
+    }
+
+    Some(rep.target_lang)
 }
 
 unsafe fn set_clipboard_unicode_text(text: &str) -> bool {
@@ -2480,7 +2723,7 @@ unsafe fn execute_switch_selected_text(hwnd: HWND, state_arc: &Arc<Mutex<AppUiSt
         if GetClipboardSequenceNumber() != seq_before {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
     let mut converted_opt: Option<(String, String)> = None;
@@ -2551,7 +2794,7 @@ unsafe fn execute_switch_selected_text(hwnd: HWND, state_arc: &Arc<Mutex<AppUiSt
         }
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(15));
+    std::thread::sleep(std::time::Duration::from_millis(25));
     IS_INJECTING.store(false, Ordering::SeqCst);
 }
 
@@ -2566,6 +2809,7 @@ fn start_keyboard_worker_and_hook(state_arc: Arc<Mutex<AppUiState>>) {
         let mut last_fg: usize = 0;
         let mut last_proc_name = String::new();
         let mut last_switch_at: Option<(Instant, Language)> = None;
+        let mut is_first_word_in_field = true;
 
         while let Ok(ev) = rx.recv() {
             match ev {
@@ -2573,9 +2817,10 @@ fn start_keyboard_worker_and_hook(state_arc: Arc<Mutex<AppUiState>>) {
                     let fg = hwnd as HWND;
                     if hwnd != last_fg {
                         last_proc_name = query_foreground_process_name(fg);
+                        is_first_word_in_field = true;
                     }
                     let os_lang = match last_switch_at {
-                        Some((t, lang)) if hwnd == last_fg && t.elapsed().as_millis() < 120 => {
+                        Some((t, lang)) if hwnd == last_fg && t.elapsed().as_millis() < 60 => {
                             lang
                         }
                         _ => detect_window_input_language(fg),
@@ -2597,18 +2842,39 @@ fn start_keyboard_worker_and_hook(state_arc: Arc<Mutex<AppUiState>>) {
                         None
                     };
                     if let Some(rep) = rep_opt {
-                        let target = rep.target_lang;
-                        execute_os_replacement(fg, &rep);
-                        last_switch_at = Some((Instant::now(), target));
-                        if let Ok(m_slot) = MAIN_HWND.lock() {
-                            if *m_slot != 0 {
-                                PostMessageW(*m_slot as HWND, WM_ENGINE_NOTIFY, 0, 0);
+                        let extra_bs = if is_first_word_in_field
+                            && rep.backspaces >= 2
+                            && matches!(
+                                last_proc_name.as_str(),
+                                "chrome" | "msedge" | "brave" | "opera" | "vivaldi"
+                            ) {
+                            1
+                        } else {
+                            0
+                        };
+                        if let Some(target) = execute_os_replacement(
+                            fg,
+                            &rep,
+                            &rx,
+                            &worker_state,
+                            hwnd,
+                            extra_bs,
+                        ) {
+                            last_switch_at = Some((Instant::now(), target));
+                            if let Ok(m_slot) = MAIN_HWND.lock() {
+                                if *m_slot != 0 {
+                                    PostMessageW(*m_slot as HWND, WM_ENGINE_NOTIFY, 0, 0);
+                                }
                             }
                         }
                     }
                 }
                 HookEvent::Boundary { ch, hwnd } => {
                     let fg = hwnd as HWND;
+                    last_switch_at = None;
+                    if hwnd != last_fg {
+                        is_first_word_in_field = true;
+                    }
                     let rep_opt = if let Ok(mut st) = worker_state.lock() {
                         if hwnd != last_fg {
                             st.engine.reset_all_buffers();
@@ -2623,28 +2889,56 @@ fn start_keyboard_worker_and_hook(state_arc: Arc<Mutex<AppUiState>>) {
                         None
                     };
                     if let Some(rep) = rep_opt {
-                        let target = rep.target_lang;
-                        execute_os_replacement(fg, &rep);
-                        last_switch_at = Some((Instant::now(), target));
-                        if let Ok(m_slot) = MAIN_HWND.lock() {
-                            if *m_slot != 0 {
-                                PostMessageW(*m_slot as HWND, WM_ENGINE_NOTIFY, 0, 0);
+                        let extra_bs = if is_first_word_in_field
+                            && rep.backspaces >= 2
+                            && matches!(
+                                last_proc_name.as_str(),
+                                "chrome" | "msedge" | "brave" | "opera" | "vivaldi"
+                            ) {
+                            1
+                        } else {
+                            0
+                        };
+                        if let Some(target) = execute_os_replacement(
+                            fg,
+                            &rep,
+                            &rx,
+                            &worker_state,
+                            hwnd,
+                            extra_bs,
+                        ) {
+                            last_switch_at = Some((Instant::now(), target));
+                            if let Ok(m_slot) = MAIN_HWND.lock() {
+                                if *m_slot != 0 {
+                                    PostMessageW(*m_slot as HWND, WM_ENGINE_NOTIFY, 0, 0);
+                                }
                             }
                         }
                     }
+                    is_first_word_in_field = ch == '\n';
                 }
                 HookEvent::Backspace => {
                     if let Ok(mut st) = worker_state.lock() {
                         st.engine.handle_backspace();
+                        if st.engine.eng_filter.buffer.is_empty()
+                            && st.engine.last_space_eng.is_empty()
+                        {
+                            is_first_word_in_field = true;
+                        }
                     }
                 }
                 HookEvent::ClearBuffer => {
+                    last_switch_at = None;
+                    is_first_word_in_field = true;
                     if let Ok(mut st) = worker_state.lock() {
                         st.engine.reset_all_buffers();
                     }
                 }
                 HookEvent::SwitchBufferShortcut { hwnd } => {
                     let fg = hwnd as HWND;
+                    if hwnd != last_fg {
+                        is_first_word_in_field = true;
+                    }
                     let rep_opt = if let Ok(mut st) = worker_state.lock() {
                         if hwnd != last_fg {
                             st.engine.reset_all_buffers();
@@ -2659,12 +2953,29 @@ fn start_keyboard_worker_and_hook(state_arc: Arc<Mutex<AppUiState>>) {
                         None
                     };
                     if let Some(rep) = rep_opt {
-                        let target = rep.target_lang;
-                        execute_os_replacement(fg, &rep);
-                        last_switch_at = Some((Instant::now(), target));
-                        if let Ok(m_slot) = MAIN_HWND.lock() {
-                            if *m_slot != 0 {
-                                PostMessageW(*m_slot as HWND, WM_ENGINE_NOTIFY, 0, 0);
+                        let extra_bs = if is_first_word_in_field
+                            && rep.backspaces >= 2
+                            && matches!(
+                                last_proc_name.as_str(),
+                                "chrome" | "msedge" | "brave" | "opera" | "vivaldi"
+                            ) {
+                            1
+                        } else {
+                            0
+                        };
+                        if let Some(target) = execute_os_replacement(
+                            fg,
+                            &rep,
+                            &rx,
+                            &worker_state,
+                            hwnd,
+                            extra_bs,
+                        ) {
+                            last_switch_at = Some((Instant::now(), target));
+                            if let Ok(m_slot) = MAIN_HWND.lock() {
+                                if *m_slot != 0 {
+                                    PostMessageW(*m_slot as HWND, WM_ENGINE_NOTIFY, 0, 0);
+                                }
                             }
                         }
                     }
@@ -2687,16 +2998,59 @@ fn start_keyboard_worker_and_hook(state_arc: Arc<Mutex<AppUiState>>) {
     });
 
     std::thread::spawn(|| unsafe {
-        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_kbd_proc), null_mut(), 0);
-        if !hook.is_null() {
+        let kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_kbd_proc), null_mut(), 0);
+        let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), null_mut(), 0);
+        if !kbd_hook.is_null() || !mouse_hook.is_null() {
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            UnhookWindowsHookEx(hook);
+            if !kbd_hook.is_null() {
+                UnhookWindowsHookEx(kbd_hook);
+            }
+            if !mouse_hook.is_null() {
+                UnhookWindowsHookEx(mouse_hook);
+            }
         }
     });
+}
+
+fn is_modifier_vk(vk: u32) -> bool {
+    matches!(
+        vk as i32,
+        VK_SHIFT
+            | VK_LSHIFT
+            | VK_RSHIFT
+            | VK_CONTROL
+            | VK_LCONTROL
+            | VK_RCONTROL
+            | VK_MENU
+            | VK_LMENU
+            | VK_RMENU
+            | VK_LWIN
+            | VK_RWIN
+    )
+}
+
+unsafe extern "system" fn low_level_mouse_proc(
+    n_code: i32,
+    w_param: WPARAM,
+    _l_param: LPARAM,
+) -> LRESULT {
+    if n_code >= 0
+        && (w_param == WM_LBUTTONDOWN as usize || w_param == WM_RBUTTONDOWN as usize)
+    {
+        if DEFER_ACTIVE.load(Ordering::Acquire) {
+            DEFER_ABORTED.store(true, Ordering::Release);
+        }
+        if let Ok(guard) = HOOK_SENDER.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(HookEvent::ClearBuffer);
+            }
+        }
+    }
+    CallNextHookEx(null_mut(), n_code, w_param, _l_param)
 }
 
 unsafe extern "system" fn low_level_kbd_proc(
@@ -2704,102 +3058,148 @@ unsafe extern "system" fn low_level_kbd_proc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    if n_code >= 0
-        && !IS_INJECTING.load(Ordering::Relaxed)
-        && (w_param == WM_KEYDOWN as usize || w_param == WM_SYSKEYDOWN as usize)
-    {
+    if n_code >= 0 && (w_param == WM_KEYDOWN as usize || w_param == WM_SYSKEYDOWN as usize) {
         let kb = &*(l_param as *const KBDLLHOOKSTRUCT);
         if (kb.flags & 0x10) == 0 {
+            let vk = kb.vkCode;
+            if is_modifier_vk(vk) {
+                return CallNextHookEx(null_mut(), n_code, w_param, l_param);
+            }
+
             let shift_down = (GetAsyncKeyState(VK_SHIFT) as u16 & 0x8000) != 0;
             let ctrl_down = (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0;
             let alt_down = (GetAsyncKeyState(VK_MENU) as u16 & 0x8000) != 0;
             let win_down = (GetAsyncKeyState(VK_LWIN) as u16 & 0x8000) != 0
                 || (GetAsyncKeyState(VK_RWIN) as u16 & 0x8000) != 0;
             let caps_on = (GetKeyState(VK_CAPITAL) & 1) != 0;
-            let vk = kb.vkCode;
             let fg_hwnd = GetForegroundWindow() as usize;
 
-            let mouse_clicked =
-                ((GetAsyncKeyState(VK_LBUTTON) as u16) & 1) != 0
-                    || ((GetAsyncKeyState(VK_RBUTTON) as u16) & 1) != 0;
+            if DEFER_ACTIVE.load(Ordering::Acquire) {
+                if let Ok(m_slot) = MAIN_HWND.lock() {
+                    if *m_slot != 0 && fg_hwnd == *m_slot {
+                        return CallNextHookEx(null_mut(), n_code, w_param, l_param);
+                    }
+                }
+                if win_down
+                    || ctrl_down
+                    || alt_down
+                    || (vk == VK_OEM_3 as u32
+                        && !shift_down
+                        && read_windows_lang_hotkey() == 4)
+                {
+                    DEFER_ABORTED.store(true, Ordering::Release);
+                    return CallNextHookEx(null_mut(), n_code, w_param, l_param);
+                }
 
-            if let Ok(guard) = HOOK_SENDER.lock() {
-                if let Some(tx) = guard.as_ref() {
-                    if ctrl_down && !shift_down && !alt_down && vk == VK_CAPITAL as u32 {
-                        let _ = tx.send(HookEvent::ToggleMode);
-                        return 1;
-                    }
-                    let buf_sc = ACTIVE_BUF_SC.load(Ordering::Relaxed);
-                    let sel_sc = ACTIVE_SEL_SC.load(Ordering::Relaxed);
-                    let hit_buf = match buf_sc {
-                        1 => ctrl_down && !shift_down && vk == VK_BACK as u32,
-                        2 => vk == VK_PAUSE as u32,
-                        _ => shift_down && !ctrl_down && vk == VK_BACK as u32,
-                    };
-                    if hit_buf {
-                        let _ = tx.send(HookEvent::SwitchBufferShortcut { hwnd: fg_hwnd });
-                        return 1;
-                    }
-                    let hit_sel = match sel_sc {
-                        1 => vk == VK_SCROLL as u32,
-                        _ => shift_down && !ctrl_down && vk == VK_CAPITAL as u32,
-                    };
-                    if hit_sel {
-                        let _ = tx.send(HookEvent::SwitchSelectedShortcut { hwnd: fg_hwnd });
-                        return 1;
-                    }
+                let mapped_dk = if vk == VK_BACK as u32 && !shift_down {
+                    Some(DeferredKey::Backspace)
+                } else if vk == VK_SPACE as u32 {
+                    Some(DeferredKey::Boundary(' '))
+                } else if vk == VK_RETURN as u32 {
+                    Some(DeferredKey::Boundary('\n'))
+                } else if vk == VK_TAB as u32 {
+                    Some(DeferredKey::Boundary('\t'))
+                } else {
+                    vk_to_us_char(vk, shift_down, caps_on).map(DeferredKey::Printable)
+                };
 
-                    if mouse_clicked {
-                        let _ = tx.send(HookEvent::ClearBuffer);
-                    }
-
-                    if let Ok(m_slot) = MAIN_HWND.lock() {
-                        if *m_slot != 0 && fg_hwnd == *m_slot {
-                            return CallNextHookEx(null_mut(), n_code, w_param, l_param);
+                if let Some(dk) = mapped_dk {
+                    let pushed = if let Ok(mut q) = DEFERRED_KEYS.lock() {
+                        if DEFER_ACTIVE.load(Ordering::Acquire) && q.len() < 64 {
+                            q.push((dk, fg_hwnd));
+                            true
+                        } else {
+                            false
                         }
+                    } else {
+                        false
+                    };
+                    if pushed {
+                        return 1;
                     }
+                } else {
+                    DEFER_ABORTED.store(true, Ordering::Release);
+                    return CallNextHookEx(null_mut(), n_code, w_param, l_param);
+                }
+            }
 
-                    if win_down || ctrl_down || alt_down {
-                        let _ = tx.send(HookEvent::ClearBuffer);
-                    } else if vk == VK_OEM_3 as u32 && !shift_down && read_windows_lang_hotkey() == 4
-                    {
-                        let _ = tx.send(HookEvent::ClearBuffer);
-                    } else if vk == VK_BACK as u32 {
-                        let _ = tx.send(HookEvent::Backspace);
-                    } else if vk == VK_SPACE as u32 {
-                        let _ = tx.send(HookEvent::Boundary {
-                            ch: ' ',
-                            hwnd: fg_hwnd,
-                        });
-                    } else if vk == VK_RETURN as u32 {
-                        let _ = tx.send(HookEvent::Boundary {
-                            ch: '\n',
-                            hwnd: fg_hwnd,
-                        });
-                    } else if vk == VK_TAB as u32 {
-                        let _ = tx.send(HookEvent::Boundary {
-                            ch: '\t',
-                            hwnd: fg_hwnd,
-                        });
-                    } else if matches!(
-                        vk as i32,
-                        VK_LEFT
-                            | VK_RIGHT
-                            | VK_UP
-                            | VK_DOWN
-                            | VK_HOME
-                            | VK_END
-                            | VK_PRIOR
-                            | VK_NEXT
-                            | VK_DELETE
-                            | VK_ESCAPE
-                    ) {
-                        let _ = tx.send(HookEvent::ClearBuffer);
-                    } else if let Some(us_char) = vk_to_us_char(vk, shift_down, caps_on) {
-                        let _ = tx.send(HookEvent::PrintableKey {
-                            us_char,
-                            hwnd: fg_hwnd,
-                        });
+            if !IS_INJECTING.load(Ordering::Acquire) {
+                if let Ok(guard) = HOOK_SENDER.lock() {
+                    if let Some(tx) = guard.as_ref() {
+                        if ctrl_down && !shift_down && !alt_down && vk == VK_CAPITAL as u32 {
+                            let _ = tx.send(HookEvent::ToggleMode);
+                            return 1;
+                        }
+                        let buf_sc = ACTIVE_BUF_SC.load(Ordering::Relaxed);
+                        let sel_sc = ACTIVE_SEL_SC.load(Ordering::Relaxed);
+                        let hit_buf = match buf_sc {
+                            1 => ctrl_down && !shift_down && vk == VK_BACK as u32,
+                            2 => vk == VK_PAUSE as u32,
+                            _ => shift_down && !ctrl_down && vk == VK_BACK as u32,
+                        };
+                        if hit_buf {
+                            let _ = tx.send(HookEvent::SwitchBufferShortcut { hwnd: fg_hwnd });
+                            return 1;
+                        }
+                        let hit_sel = match sel_sc {
+                            1 => vk == VK_SCROLL as u32,
+                            _ => shift_down && !ctrl_down && vk == VK_CAPITAL as u32,
+                        };
+                        if hit_sel {
+                            let _ = tx.send(HookEvent::SwitchSelectedShortcut { hwnd: fg_hwnd });
+                            return 1;
+                        }
+
+                        if let Ok(m_slot) = MAIN_HWND.lock() {
+                            if *m_slot != 0 && fg_hwnd == *m_slot {
+                                return CallNextHookEx(null_mut(), n_code, w_param, l_param);
+                            }
+                        }
+
+                        if win_down || ctrl_down || alt_down {
+                            let _ = tx.send(HookEvent::ClearBuffer);
+                        } else if vk == VK_OEM_3 as u32
+                            && !shift_down
+                            && read_windows_lang_hotkey() == 4
+                        {
+                            let _ = tx.send(HookEvent::ClearBuffer);
+                        } else if vk == VK_BACK as u32 {
+                            let _ = tx.send(HookEvent::Backspace);
+                        } else if vk == VK_SPACE as u32 {
+                            let _ = tx.send(HookEvent::Boundary {
+                                ch: ' ',
+                                hwnd: fg_hwnd,
+                            });
+                        } else if vk == VK_RETURN as u32 {
+                            let _ = tx.send(HookEvent::Boundary {
+                                ch: '\n',
+                                hwnd: fg_hwnd,
+                            });
+                        } else if vk == VK_TAB as u32 {
+                            let _ = tx.send(HookEvent::Boundary {
+                                ch: '\t',
+                                hwnd: fg_hwnd,
+                            });
+                        } else if matches!(
+                            vk as i32,
+                            VK_LEFT
+                                | VK_RIGHT
+                                | VK_UP
+                                | VK_DOWN
+                                | VK_HOME
+                                | VK_END
+                                | VK_PRIOR
+                                | VK_NEXT
+                                | VK_DELETE
+                                | VK_ESCAPE
+                        ) {
+                            let _ = tx.send(HookEvent::ClearBuffer);
+                        } else if let Some(us_char) = vk_to_us_char(vk, shift_down, caps_on) {
+                            let _ = tx.send(HookEvent::PrintableKey {
+                                us_char,
+                                hwnd: fg_hwnd,
+                            });
+                        }
                     }
                 }
             }

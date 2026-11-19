@@ -36,6 +36,92 @@ const COMMON_SHORT_EN: &[&str] = &[
     "no", "of", "ok", "on", "or", "so", "to", "up", "us", "we",
 ];
 
+const COMMON_MODERN_EN: &[&str] = &[
+    "discord", "youtube", "github", "chatgpt", "facebook", "instagram", "tiktok", "spotify",
+    "netflix", "vscode", "rust", "docker", "typescript", "javascript", "valorant", "roblox",
+    "minecraft", "reddit", "twitter", "gmail", "logout", "wifi", "bluetooth", "iphone", "android",
+    "deploy", "npm", "git", "sql", "api", "json", "html", "css", "http", "https", "url", "app",
+    "apps", "uninstall", "restart", "shutdown", "figma", "canva", "shopee", "lazada", "prompt",
+    "claude", "openai", "username", "keyswitch", "sudo", "cursor", "antigravity", "gemini",
+    "supabase", "vercel", "netlify", "firebase", "cloudflare", "tailwind", "nextjs", "nodejs",
+    "golang", "kotlin", "flutter", "ubuntu", "kubernetes", "terraform", "graphql", "oauth",
+    "regex", "async", "await", "mutex", "struct", "cargo", "localhost", "frontend", "backend",
+    "fullstack", "webhook", "markdown", "refactor", "workflow", "sandbox", "tooltip", "checkbox",
+    "dropdown", "autostart", "clipboard", "esports", "podcast", "emoji", "avatar", "unmute",
+    "unban", "webcam", "headset", "mousepad", "router", "modem", "torrent", "bitrate", "ffmpeg",
+    "anime", "manga", "cosplay", "meme", "memes", "vlog", "diff", "func", "repo", "stash",
+    "rebase", "lint", "vpn", "dns", "ssl", "ssh", "cli", "gui", "ide", "llm", "cpu", "ram",
+    "ssd", "usb", "fps", "afk", "obs", "pdf", "zip", "exe", "apk", "png", "jpg", "svg", "gif",
+    "twitch", "steam", "nvidia", "slack", "notion", "zoom", "chrome",
+];
+
+pub fn is_sane_user_word_en(w: &str) -> bool {
+    let len = w.len();
+    if !(4..=24).contains(&len) || !w.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut prev = 0u8;
+    let mut run = 0u8;
+    let mut has_vowel = false;
+    let mut counts = [0u8; 26];
+    for b in w.bytes() {
+        let lb = b.to_ascii_lowercase();
+        if lb == prev {
+            run += 1;
+            if run >= 3 {
+                return false;
+            }
+        } else {
+            prev = lb;
+            run = 1;
+        }
+        if matches!(lb, b'a' | b'e' | b'i' | b'o' | b'u' | b'y') {
+            has_vowel = true;
+        }
+        counts[(lb - b'a') as usize] += 1;
+    }
+    if !has_vowel {
+        return false;
+    }
+    if len >= 6 && counts.iter().any(|&c| (c as usize) > len / 2) {
+        return false;
+    }
+    true
+}
+
+pub fn is_sane_user_word_th(w: &str) -> bool {
+    let len = w.chars().count();
+    if !(2..=24).contains(&len) || !has_valid_thai_sequence(w) || w.contains('ๅ') {
+        return false;
+    }
+    let mut chars = w.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let fu = first as u32;
+    if !((0x0E01..=0x0E2E).contains(&fu) || (0x0E40..=0x0E44).contains(&fu)) {
+        return false;
+    }
+    let mut has_consonant = (0x0E01..=0x0E2E).contains(&fu);
+    let mut prev = first;
+    let mut run = 1u8;
+    for c in chars {
+        if (0x0E01..=0x0E2E).contains(&(c as u32)) {
+            has_consonant = true;
+        }
+        if c == prev {
+            run += 1;
+            if run >= 4 {
+                return false;
+            }
+        } else {
+            prev = c;
+            run = 1;
+        }
+    }
+    has_consonant
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     English,
@@ -665,7 +751,8 @@ impl WordDictFilter {
             word_ids: Vec::new(),
         });
 
-        let total_cap = base_words.len() + user_words.len();
+        let total_cap =
+            base_words.len() + user_words.len() + COMMON_SHORT_EN.len() + COMMON_MODERN_EN.len();
         self.word_set.reserve(total_cap);
         self.word_slices.reserve(total_cap);
         self.char_pool.reserve(total_cap * 6);
@@ -678,7 +765,7 @@ impl WordDictFilter {
             }
         }
         if self.language == Language::English {
-            for &short_w in COMMON_SHORT_EN {
+            for &short_w in COMMON_SHORT_EN.iter().chain(COMMON_MODERN_EN.iter()) {
                 if self.word_set.insert(short_w.to_string()) {
                     self.insert_into_arena_and_trie(short_w);
                 }
@@ -686,7 +773,11 @@ impl WordDictFilter {
         }
         for w in user_words {
             let trimmed = w.trim().to_lowercase();
-            if !trimmed.is_empty() {
+            let valid = match self.language {
+                Language::English => is_sane_user_word_en(&trimmed),
+                Language::Thai => is_sane_user_word_th(&trimmed),
+            };
+            if valid {
                 if self.word_set.insert(trimmed.clone()) {
                     self.insert_into_arena_and_trie(&trimmed);
                 }
@@ -913,6 +1004,15 @@ impl WordDictFilter {
         dist_map: &HashMap<(char, char), CharDistanceKind>,
         cfg: &DistanceConfig,
     ) -> FilterEval {
+        self.evaluate_mode(dist_map, cfg, false)
+    }
+
+    pub fn evaluate_mode(
+        &mut self,
+        dist_map: &HashMap<(char, char), CharDistanceKind>,
+        cfg: &DistanceConfig,
+        prefix_only: bool,
+    ) -> FilterEval {
         let mut raw_chars = ['\0'; 128];
         let mut raw_len = 0usize;
         let mut first_raw = '\0';
@@ -963,6 +1063,19 @@ impl WordDictFilter {
             return eval;
         }
 
+        if prefix_only
+            && (self.has_prefix(&full_str)
+                || (self.language == Language::Thai && self.try_compose_prefix(&full_str)))
+        {
+            let eval = FilterEval {
+                is_exact_match: false,
+                is_close_match: false,
+                is_close_prefix_match: true,
+            };
+            self.last_eval = eval.clone();
+            return eval;
+        }
+
         if full_n > 31 {
             let eval = FilterEval::default();
             self.last_eval = eval.clone();
@@ -973,7 +1086,7 @@ impl WordDictFilter {
         let input_slice = &full_norm[..n];
 
         let allowed_distance = (n as f64) * cfg.quota;
-        let prune_limit = allowed_distance + 1.15;
+        let prune_limit = allowed_distance + 1e-9;
         let mut exact_distance = 100.0_f64;
         let mut best_distance = 100.0_f64;
 
@@ -996,11 +1109,16 @@ impl WordDictFilter {
                     input_slice,
                     &dp1,
                     pref1,
+                    prune_limit,
+                    prefix_only,
                     dist_map,
                     cfg,
                     &mut exact_distance,
                     &mut best_distance,
                 );
+                if prefix_only && best_distance < prune_limit {
+                    break;
+                }
 
                 let mut d2_idx = self.trie_nodes[d1_idx as usize].first_child;
                 while d2_idx != INVALID_NODE {
@@ -1010,51 +1128,69 @@ impl WordDictFilter {
                         compute_dp_step(input_slice, node2_ch, 2, &dp1, &mut dp2, dist_map, cfg);
                     let pref2 = pref1.min(dp2[n]);
 
-                    if min2 <= prune_limit {
+                    if min2 <= prune_limit || pref1 <= prune_limit {
                         self.eval_node_words(
                             d2_idx,
                             2,
                             input_slice,
                             &dp2,
                             pref2,
+                            prune_limit,
+                            prefix_only,
                             dist_map,
                             cfg,
                             &mut exact_distance,
                             &mut best_distance,
                         );
+                        if prefix_only && best_distance < prune_limit {
+                            break;
+                        }
 
-                        let mut d3_idx = self.trie_nodes[d2_idx as usize].first_child;
-                        while d3_idx != INVALID_NODE {
-                            let node3_ch = self.trie_nodes[d3_idx as usize].ch;
-                            let mut dp3 = [0.0_f64; 32];
-                            let min3 = compute_dp_step(
-                                input_slice,
-                                node3_ch,
-                                3,
-                                &dp2,
-                                &mut dp3,
-                                dist_map,
-                                cfg,
-                            );
-                            let pref3 = pref2.min(dp3[n]);
-
-                            if min3 <= prune_limit {
-                                self.eval_node_words(
-                                    d3_idx,
-                                    3,
+                        if min2 <= prune_limit {
+                            let mut d3_idx = self.trie_nodes[d2_idx as usize].first_child;
+                            while d3_idx != INVALID_NODE {
+                                let node3_ch = self.trie_nodes[d3_idx as usize].ch;
+                                let mut dp3 = [0.0_f64; 32];
+                                let min3 = compute_dp_step(
                                     input_slice,
-                                    &dp3,
-                                    pref3,
+                                    node3_ch,
+                                    3,
+                                    &dp2,
+                                    &mut dp3,
                                     dist_map,
                                     cfg,
-                                    &mut exact_distance,
-                                    &mut best_distance,
                                 );
+                                let pref3 = pref2.min(dp3[n]);
+
+                                if min3 <= prune_limit || pref2 <= prune_limit {
+                                    self.eval_node_words(
+                                        d3_idx,
+                                        3,
+                                        input_slice,
+                                        &dp3,
+                                        pref3,
+                                        prune_limit,
+                                        prefix_only,
+                                        dist_map,
+                                        cfg,
+                                        &mut exact_distance,
+                                        &mut best_distance,
+                                    );
+                                    if prefix_only && best_distance < prune_limit {
+                                        break;
+                                    }
+                                }
+                                d3_idx = self.trie_nodes[d3_idx as usize].next_sibling;
                             }
-                            d3_idx = self.trie_nodes[d3_idx as usize].next_sibling;
+                            if prefix_only && best_distance < prune_limit {
+                                break;
+                            }
                         }
                     }
                     d2_idx = self.trie_nodes[d2_idx as usize].next_sibling;
+                }
+                if prefix_only && best_distance < prune_limit {
+                    break;
                 }
             }
             d1_idx = self.trie_nodes[d1_idx as usize].next_sibling;
@@ -1078,6 +1214,8 @@ impl WordDictFilter {
         input: &[char],
         dp_start: &[f64; 32],
         best_pref_so_far: f64,
+        prune_limit: f64,
+        prefix_only: bool,
         dist_map: &HashMap<(char, char), CharDistanceKind>,
         cfg: &DistanceConfig,
         exact_distance: &mut f64,
@@ -1095,27 +1233,36 @@ impl WordDictFilter {
             let mut prev = *dp_start;
             let mut curr = [0.0_f64; 32];
             let mut best_pref = best_pref_so_far;
+            let mut pruned = false;
 
             for i in (start_depth + 1)..=max_m {
                 let wc = w_chars[i - 1];
-                let _ = compute_dp_step(input, wc, i, &prev, &mut curr, dist_map, cfg);
+                let row_min = compute_dp_step(input, wc, i, &prev, &mut curr, dist_map, cfg);
                 if curr[n] < best_pref {
                     best_pref = curr[n];
                 }
                 prev = curr;
+                if row_min > prune_limit {
+                    pruned = true;
+                    break;
+                }
             }
 
-            let full_d = if m <= max_m {
-                prev[n]
-            } else {
-                prev[n] + ((m - max_m) as f64) * ADD_DISTANCE
-            };
-
-            if full_d < *exact_distance {
-                *exact_distance = full_d;
+            if !pruned {
+                let full_d = if m <= max_m {
+                    prev[n]
+                } else {
+                    prev[n] + ((m - max_m) as f64) * ADD_DISTANCE
+                };
+                if full_d < *exact_distance {
+                    *exact_distance = full_d;
+                }
             }
             if best_pref < *best_distance {
                 *best_distance = best_pref;
+            }
+            if prefix_only && *best_distance < prune_limit {
+                return;
             }
         }
     }
@@ -1218,6 +1365,83 @@ pub struct PendingOsReplacement {
     pub replacement_text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredKey {
+    Printable(char),
+    Boundary(char),
+    Backspace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciledReplacement {
+    pub backspaces: usize,
+    pub base_text: String,
+    pub replay_keys: Vec<DeferredKey>,
+    pub aborted: bool,
+}
+
+pub fn reconcile_replacement_queue(
+    rep: &PendingOsReplacement,
+    leaked_events: &[DeferredKey],
+) -> ReconciledReplacement {
+    let mut backspaces = rep.backspaces;
+    let mut base_text = rep.replacement_text.clone();
+    let mut replay_keys = Vec::with_capacity(leaked_events.len());
+    let mut aborted = false;
+
+    for &ev in leaked_events {
+        match ev {
+            DeferredKey::Printable(c) => {
+                backspaces += 1;
+                replay_keys.push(DeferredKey::Printable(c));
+            }
+            DeferredKey::Boundary(ch) if ch == ' ' || ch == '\t' => {
+                backspaces += 1;
+                replay_keys.push(DeferredKey::Boundary(ch));
+            }
+            DeferredKey::Boundary(_) => {
+                aborted = true;
+                break;
+            }
+            DeferredKey::Backspace => {
+                if replay_keys.pop().is_some() {
+                    backspaces = backspaces.saturating_sub(1);
+                } else if backspaces > 0 {
+                    backspaces -= 1;
+                    let _ = base_text.pop();
+                }
+            }
+        }
+    }
+
+    ReconciledReplacement {
+        backspaces,
+        base_text,
+        replay_keys,
+        aborted,
+    }
+}
+
+fn strip_leading_open_bracket(s: &str) -> &str {
+    if let Some(first) = s.chars().next() {
+        if matches!(first, '(' | '[' | '{' | '"' | '\'' | '“' | '‘') {
+            return &s[first.len_utf8()..];
+        }
+    }
+    s
+}
+
+fn tail_is_ascii_alpha(s: &str, k: usize) -> bool {
+    let mut count = 0usize;
+    for c in s.chars().rev().take(k) {
+        if !c.is_ascii_alphabetic() {
+            return false;
+        }
+        count += 1;
+    }
+    count == k
+}
+
 pub struct RightLangEngine {
     pub mode: CorrectionMode,
     pub auto_start: bool,
@@ -1238,6 +1462,7 @@ pub struct RightLangEngine {
     pub thai_tone_marks: usize,
     pub learn_this: bool,
     pub can_undo: bool,
+    pub just_auto_switched_midword: bool,
     pub last_uncorrected: String,
     pub last_corrected: String,
     pub last_undo_backspaces: usize,
@@ -1276,6 +1501,7 @@ impl RightLangEngine {
             thai_tone_marks: 0,
             learn_this: false,
             can_undo: false,
+            just_auto_switched_midword: false,
             last_uncorrected: String::new(),
             last_corrected: String::new(),
             last_undo_backspaces: 0,
@@ -1302,11 +1528,7 @@ impl RightLangEngine {
     }
 
     pub fn active_checking_rule(&self) -> SequenceCheckingRule {
-        match self.active_process_name.as_str() {
-            "winword" | "excel" | "powerpnt" => SequenceCheckingRule::Replace,
-            "notepad" | "wordpad" => SequenceCheckingRule::Basic,
-            _ => SequenceCheckingRule::None,
-        }
+        SequenceCheckingRule::None
     }
 
     pub fn effective_mode(&self) -> CorrectionMode {
@@ -1339,6 +1561,7 @@ impl RightLangEngine {
         self.clear_current_word();
         self.clear_last_space();
         self.can_undo = false;
+        self.just_auto_switched_midword = false;
         self.last_uncorrected.clear();
         self.last_corrected.clear();
         self.last_undo_backspaces = 0;
@@ -1379,12 +1602,8 @@ impl RightLangEngine {
                 self.char_counts = std::mem::take(&mut self.last_space_char_counts);
                 self.active_language = self.last_space_lang;
                 self.recompute_thai_metrics();
-                if self.effective_mode() == CorrectionMode::Online
-                    && self.eng_filter.buffer.chars().count() >= 2
-                {
-                    self.eng_filter.evaluate(&self.dist_map, &self.dist_config);
-                    self.thai_filter.evaluate(&self.dist_map, &self.dist_config);
-                }
+                self.eng_filter.last_eval = FilterEval::default();
+                self.thai_filter.last_eval = FilterEval::default();
             }
             return;
         }
@@ -1396,15 +1615,8 @@ impl RightLangEngine {
             self.clear_current_word();
         } else {
             self.recompute_thai_metrics();
-            if self.effective_mode() == CorrectionMode::Online
-                && self.eng_filter.buffer.chars().count() >= 2
-            {
-                self.eng_filter.evaluate(&self.dist_map, &self.dist_config);
-                self.thai_filter.evaluate(&self.dist_map, &self.dist_config);
-            } else {
-                self.eng_filter.last_eval = FilterEval::default();
-                self.thai_filter.last_eval = FilterEval::default();
-            }
+            self.eng_filter.last_eval = FilterEval::default();
+            self.thai_filter.last_eval = FilterEval::default();
         }
     }
 
@@ -1457,6 +1669,8 @@ impl RightLangEngine {
             Language::Thai => {
                 if self.is_valid_thai_text(full_thai)
                     || self.is_valid_english_token(full_eng)
+                    || (full_eng.chars().all(|c| c.is_ascii_alphabetic())
+                        && self.eng_filter.has_prefix(full_eng))
                 {
                     return None;
                 }
@@ -1483,6 +1697,9 @@ impl RightLangEngine {
 
             match self.active_language {
                 Language::Thai => {
+                    if split < 3 && self.eng_filter.has_prefix(prefix_eng) {
+                        continue;
+                    }
                     let prefix_ok = has_valid_thai_sequence(prefix_thai)
                         && (self.thai_filter.word_set.contains(prefix_thai)
                             || self.thai_filter.try_compose(prefix_thai));
@@ -1495,21 +1712,19 @@ impl RightLangEngine {
                     if !suffix_eng.chars().all(|c| c.is_ascii_alphabetic()) {
                         continue;
                     }
+                    let can_fallback = allow_alpha_fallback
+                        && split >= 3
+                        && (split >= 4 || !prefix_eng.chars().all(|c| c.is_ascii_alphabetic()))
+                        && !self.thai_filter.try_compose(suffix_thai);
                     let suffix_en_ok = if suffix_len == 2 {
                         if !suffix_eng.bytes().any(|b| b.is_ascii_uppercase()) {
-                            COMMON_SHORT_EN.contains(&suffix_eng)
-                                || (allow_alpha_fallback
-                                    && !self.thai_filter.try_compose(suffix_thai))
+                            COMMON_SHORT_EN.contains(&suffix_eng) || can_fallback
                         } else {
                             let low = suffix_eng.to_ascii_lowercase();
-                            COMMON_SHORT_EN.contains(&low.as_str())
-                                || (allow_alpha_fallback
-                                    && !self.thai_filter.try_compose(suffix_thai))
+                            COMMON_SHORT_EN.contains(&low.as_str()) || can_fallback
                         }
                     } else {
-                        self.eng_filter.contains_lower(suffix_eng)
-                            || (allow_alpha_fallback
-                                && !self.thai_filter.try_compose(suffix_thai))
+                        self.eng_filter.contains_lower(suffix_eng) || can_fallback
                     };
                     if suffix_en_ok {
                         return Some(split);
@@ -1565,12 +1780,17 @@ impl RightLangEngine {
                 } else {
                     self.clear_last_space();
                 }
+                self.just_auto_switched_midword = false;
                 return None;
             }
 
             let len = self.eng_filter.buffer.chars().count();
 
-            if eff_mode == CorrectionMode::Online && raw_char == ' ' && len >= 2 {
+            if eff_mode == CorrectionMode::Online
+                && raw_char == ' '
+                && len >= 2
+                && !self.just_auto_switched_midword
+            {
                 let eng_lower = self.eng_filter.buffer.to_lowercase();
                 let thai_buf = self.thai_filter.buffer.clone();
                 let eng_core = strip_surrounding_punct(&eng_lower);
@@ -1580,6 +1800,7 @@ impl RightLangEngine {
                     || eng_lower.contains("www.");
 
                 if self.active_language == Language::Thai {
+                    let thai_stripped = strip_leading_open_bracket(&thai_buf);
                     let thai_is_valid = if len == 2 {
                         (self.thai_filter.word_set.contains(&thai_buf)
                             || (!thai_core.is_empty()
@@ -1587,51 +1808,88 @@ impl RightLangEngine {
                             && thai_buf != "กน"
                     } else {
                         self.thai_filter.word_set.contains(&thai_buf)
+                            || (!thai_stripped.is_empty()
+                                && self.thai_filter.word_set.contains(thai_stripped))
                             || (!thai_core.is_empty()
                                 && (self.thai_filter.word_set.contains(thai_core)
                                     || (thai_core.chars().count() >= 4
                                         && self.thai_filter.try_compose(thai_core))))
-                            || self.thai_filter.last_eval.is_close_match
-                    };
-                    let eng_is_valid = if len == 2 {
-                        COMMON_SHORT_EN.contains(&eng_lower.as_str())
-                    } else {
-                        self.eng_filter.word_set.contains(&eng_lower)
-                            || self.eng_filter.last_eval.is_exact_match
-                            || (len >= 4 && self.eng_filter.last_eval.is_close_match)
+                            || (len >= 4 && self.thai_filter.try_compose(&thai_buf))
+                            || self
+                                .thai_filter
+                                .evaluate_mode(&self.dist_map, &self.dist_config, false)
+                                .is_close_match
                     };
 
-                    if !thai_is_valid && eng_is_valid {
-                        self.eng_filter.buffer.push(' ');
-                        self.thai_filter.buffer.push(' ');
-                        self.char_counts.push(1);
-                        self.switch_buffer_to(Language::English, NotificationKind::AutoCorrection);
-                        let rep = self.pending_os_replacement.take();
-                        self.clear_current_word();
-                        self.clear_last_space();
-                        return rep;
+                    if !thai_is_valid {
+                        let eng_is_valid = if len == 2 {
+                            let mut eb = self.eng_filter.buffer.bytes();
+                            let weird_case = match (eb.next(), eb.next(), eb.next()) {
+                                (Some(a), Some(b), None) => {
+                                    a.is_ascii_lowercase() && b.is_ascii_uppercase()
+                                }
+                                _ => false,
+                            };
+                            !weird_case && COMMON_SHORT_EN.contains(&eng_lower.as_str())
+                        } else {
+                            let eng_stripped = strip_leading_open_bracket(&eng_lower);
+                            self.eng_filter.word_set.contains(&eng_lower)
+                                || (!eng_stripped.is_empty()
+                                    && self.eng_filter.word_set.contains(eng_stripped))
+                                || (len >= 4
+                                    && self
+                                        .eng_filter
+                                        .evaluate_mode(&self.dist_map, &self.dist_config, false)
+                                        .is_close_match)
+                        };
+
+                        if eng_is_valid {
+                            self.eng_filter.buffer.push(' ');
+                            self.thai_filter.buffer.push(' ');
+                            self.char_counts.push(1);
+                            self.switch_buffer_to(
+                                Language::English,
+                                NotificationKind::AutoCorrection,
+                            );
+                            let rep = self.pending_os_replacement.take();
+                            self.clear_current_word();
+                            self.clear_last_space();
+                            self.just_auto_switched_midword = false;
+                            return rep;
+                        }
                     }
                 } else if self.active_language == Language::English && !is_url_or_code {
-                    let eng_is_valid = self.eng_filter.word_set.contains(&eng_lower)
-                        || (!eng_core.is_empty() && self.eng_filter.word_set.contains(eng_core))
-                        || (len >= 4 && self.eng_filter.last_eval.is_close_match);
-                    let thai_is_exact = (self.thai_filter.last_eval.is_exact_match
-                        || self.thai_filter.word_set.contains(&thai_buf))
-                        && has_valid_thai_sequence(&thai_buf);
                     let max_diacritics = (len * 2) / 3 + 1;
+                    let thai_stripped = strip_leading_open_bracket(&thai_buf);
+                    let thai_is_exact = (self.thai_vowels + self.thai_tone_marks) <= max_diacritics
+                        && has_valid_thai_sequence(&thai_buf)
+                        && (self.thai_filter.word_set.contains(&thai_buf)
+                            || (len >= 4 && self.thai_filter.try_compose(&thai_buf))
+                            || (!thai_stripped.is_empty()
+                                && (self.thai_filter.word_set.contains(thai_stripped)
+                                    || (thai_stripped.chars().count() >= 4
+                                        && self.thai_filter.try_compose(thai_stripped)))));
 
-                    if !eng_is_valid
-                        && thai_is_exact
-                        && (self.thai_vowels + self.thai_tone_marks) <= max_diacritics
-                    {
-                        self.eng_filter.buffer.push(' ');
-                        self.thai_filter.buffer.push(' ');
-                        self.char_counts.push(1);
-                        self.switch_buffer_to(Language::Thai, NotificationKind::AutoCorrection);
-                        let rep = self.pending_os_replacement.take();
-                        self.clear_current_word();
-                        self.clear_last_space();
-                        return rep;
+                    if thai_is_exact {
+                        let eng_is_valid = self.eng_filter.word_set.contains(&eng_lower)
+                            || (!eng_core.is_empty() && self.eng_filter.word_set.contains(eng_core))
+                            || (len >= 4
+                                && self
+                                    .eng_filter
+                                    .evaluate_mode(&self.dist_map, &self.dist_config, false)
+                                    .is_close_match);
+
+                        if !eng_is_valid {
+                            self.eng_filter.buffer.push(' ');
+                            self.thai_filter.buffer.push(' ');
+                            self.char_counts.push(1);
+                            self.switch_buffer_to(Language::Thai, NotificationKind::AutoCorrection);
+                            let rep = self.pending_os_replacement.take();
+                            self.clear_current_word();
+                            self.clear_last_space();
+                            self.just_auto_switched_midword = false;
+                            return rep;
+                        }
                     }
                 }
 
@@ -1649,13 +1907,22 @@ impl RightLangEngine {
                         let rep = self.pending_os_replacement.take();
                         self.clear_current_word();
                         self.clear_last_space();
+                        self.just_auto_switched_midword = false;
                         return rep;
                     }
                 }
             }
 
             if eff_mode == CorrectionMode::Online && self.learn_new_word && self.learn_this {
-                self.learn_current_word();
+                if !self.just_auto_switched_midword
+                    && !self
+                        .eng_filter
+                        .evaluate_mode(&self.dist_map, &self.dist_config, false)
+                        .is_close_match
+                    && !self.thai_filter.try_compose(&self.thai_filter.buffer)
+                {
+                    self.learn_current_word();
+                }
             }
 
             if raw_char == ' ' && !self.eng_filter.buffer.is_empty() {
@@ -1669,6 +1936,7 @@ impl RightLangEngine {
             }
 
             self.clear_current_word();
+            self.just_auto_switched_midword = false;
             return None;
         }
 
@@ -1711,7 +1979,7 @@ impl RightLangEngine {
         }
 
         let len = self.eng_filter.buffer.chars().count();
-        if len < 2 {
+        if len < DEFAULT_MIN_MIDWORD_LEN {
             return None;
         }
 
@@ -1724,22 +1992,38 @@ impl RightLangEngine {
             return None;
         }
 
-        self.eng_filter.evaluate(&self.dist_map, &self.dist_config);
-        self.thai_filter.evaluate(&self.dist_map, &self.dist_config);
+        let max_t = self.dist_config.max_threshold;
+        if self.just_auto_switched_midword {
+            if len > max_t && self.active_language == Language::English {
+                self.learn_this = true;
+            }
+            return None;
+        }
 
-        if len >= DEFAULT_MIN_MIDWORD_LEN {
-            let max_t = self.dist_config.max_threshold;
-            if self.active_language == Language::Thai {
-                let th_close_pref = self.thai_filter.last_eval.is_close_prefix_match
-                    || self.thai_filter.last_eval.is_exact_match
-                    || self.thai_filter.try_compose_prefix(&self.thai_filter.buffer);
-                let en_match = self.eng_filter.last_eval.is_exact_match
-                    || (len == max_t && self.eng_filter.last_eval.is_close_prefix_match);
-                let is_en_alpha = self.eng_filter.buffer.chars().all(|c| c.is_ascii_alphabetic());
-                if !th_close_pref && en_match && is_en_alpha {
+        if self.active_language == Language::Thai {
+            let is_en_alpha = self.eng_filter.buffer.chars().all(|c| c.is_ascii_alphabetic());
+            let en_match = if !is_en_alpha {
+                false
+            } else if len != max_t {
+                self.eng_filter.contains_lower(&self.eng_filter.buffer)
+            } else {
+                self.eng_filter
+                    .evaluate_mode(&self.dist_map, &self.dist_config, true)
+                    .is_close_prefix_match
+            };
+            let check_th = en_match
+                || (len >= 6
+                    && tail_is_ascii_alpha(&self.eng_filter.buffer, DEFAULT_MIN_MIDWORD_LEN));
+            if check_th {
+                let th_close_pref = self
+                    .thai_filter
+                    .evaluate_mode(&self.dist_map, &self.dist_config, true)
+                    .is_close_prefix_match;
+                if !th_close_pref && en_match {
                     self.switch_buffer_to(Language::English, NotificationKind::AutoCorrection);
                     let rep = self.pending_os_replacement.take();
                     self.clear_current_word();
+                    self.just_auto_switched_midword = true;
                     return rep;
                 }
                 if !th_close_pref && len >= 6 {
@@ -1753,19 +2037,35 @@ impl RightLangEngine {
                         );
                         let rep = self.pending_os_replacement.take();
                         self.clear_current_word();
+                        self.just_auto_switched_midword = true;
                         return rep;
                     }
                 }
+            }
+        } else {
+            let th_valid_seq = has_valid_thai_sequence(&self.thai_filter.buffer);
+            let th_match = if !th_valid_seq {
+                false
+            } else if len != max_t {
+                self.thai_filter.word_set.contains(&self.thai_filter.buffer)
+                    || self.thai_filter.try_compose(&self.thai_filter.buffer)
             } else {
+                self.thai_filter
+                    .evaluate_mode(&self.dist_map, &self.dist_config, true)
+                    .is_close_prefix_match
+            };
+            let max_diacritics = (len * 2) / 3 + 1;
+            let check_en =
+                (th_match && (self.thai_vowels + self.thai_tone_marks) <= max_diacritics)
+                    || len >= 6;
+            if check_en {
                 let en_core = strip_surrounding_punct(&eng_lower);
-                let en_close_pref = self.eng_filter.last_eval.is_close_prefix_match
-                    || self.eng_filter.last_eval.is_exact_match
-                    || (!en_core.is_empty() && self.eng_filter.word_set.contains(en_core));
-                let th_valid_seq = has_valid_thai_sequence(&self.thai_filter.buffer);
-                let th_match = th_valid_seq
-                    && (self.thai_filter.last_eval.is_exact_match
-                        || (len == max_t && self.thai_filter.last_eval.is_close_prefix_match));
-                let max_diacritics = (len * 2) / 3 + 1;
+                let en_close_pref = (!en_core.is_empty()
+                    && self.eng_filter.word_set.contains(en_core))
+                    || self
+                        .eng_filter
+                        .evaluate_mode(&self.dist_map, &self.dist_config, true)
+                        .is_close_prefix_match;
                 if !en_close_pref
                     && th_match
                     && (self.thai_vowels + self.thai_tone_marks) <= max_diacritics
@@ -1773,6 +2073,7 @@ impl RightLangEngine {
                     self.switch_buffer_to(Language::Thai, NotificationKind::AutoCorrection);
                     let rep = self.pending_os_replacement.take();
                     self.clear_current_word();
+                    self.just_auto_switched_midword = true;
                     return rep;
                 }
                 if !en_close_pref && len >= 6 {
@@ -1786,16 +2087,14 @@ impl RightLangEngine {
                         );
                         let rep = self.pending_os_replacement.take();
                         self.clear_current_word();
+                        self.just_auto_switched_midword = true;
                         return rep;
                     }
                 }
             }
-            if len > max_t
-                && self.active_language == Language::English
-                && !self.eng_filter.last_eval.is_close_match
-            {
-                self.learn_this = true;
-            }
+        }
+        if len > max_t && self.active_language == Language::English {
+            self.learn_this = true;
         }
 
         None
@@ -1970,10 +2269,7 @@ impl RightLangEngine {
                     .buffer
                     .trim_end_matches(ENG_TRIM_END)
                     .to_lowercase();
-                if w.chars().count() >= DEFAULT_MIN_MIDWORD_LEN
-                    && w.chars().all(|c| c.is_ascii_alphabetic())
-                    && self.eng_filter.add_user_word(&w)
-                {
+                if is_sane_user_word_en(&w) && self.eng_filter.add_user_word(&w) {
                     let _ = self.save_all_user_settings();
                 }
             }
@@ -1983,7 +2279,7 @@ impl RightLangEngine {
                 let take_n = chars.len().min(self.dist_config.max_threshold);
                 let w: String = chars[..take_n].iter().collect();
                 if take_n >= DEFAULT_MIN_MIDWORD_LEN
-                    && has_valid_thai_sequence(&w)
+                    && is_sane_user_word_th(&w)
                     && self.thai_filter.add_user_word(&w)
                 {
                     let _ = self.save_all_user_settings();
@@ -2584,5 +2880,243 @@ mod tests {
                 assert_eq!(thai_to_us_char(c), expected_en);
             }
         }
+    }
+
+    fn simulate_app_typing(eng: &mut RightLangEngine, us_keys: &str) -> (String, usize) {
+        let mut screen = String::new();
+        let mut switch_count = 0usize;
+        for c in us_keys.chars() {
+            let shown = match eng.active_language {
+                Language::English => c,
+                Language::Thai => {
+                    if c == ' ' || c == '\n' || c == '\t' {
+                        c
+                    } else {
+                        us_to_thai_char(c)
+                    }
+                }
+            };
+            screen.push(shown);
+            if let Some(rep) = eng.process_keystroke(c) {
+                for _ in 0..rep.backspaces {
+                    let _ = screen.pop();
+                }
+                screen.push_str(&rep.replacement_text);
+                switch_count += 1;
+            }
+        }
+        (screen, switch_count)
+    }
+
+    #[test]
+    fn test_discord_online_offline_and_no_false_prefix_split() {
+        let mut eng = make_test_engine();
+        eng.active_language = Language::Thai;
+        let (out, switches) = simulate_app_typing(&mut eng, "discord ");
+        assert_eq!(out, "discord ");
+        assert_eq!(switches, 1);
+
+        let mut eng_dis = make_test_engine();
+        eng_dis.active_language = Language::Thai;
+        for c in "dis".chars() {
+            assert!(
+                eng_dis.process_keystroke(c).is_none(),
+                "Should not mid-word switch on 'dis'"
+            );
+        }
+
+        eng_dis.mode = CorrectionMode::Offline;
+        let r_dis = eng_dis
+            .trigger_shift_backspace()
+            .expect("Expected Shift+Backspace on 'กรห'");
+        assert_eq!(r_dis.target_lang, Language::English);
+        assert_eq!(r_dis.replacement_text, "dis");
+        assert_eq!(r_dis.backspaces, 3);
+
+        let mut eng_off = make_test_engine();
+        eng_off.mode = CorrectionMode::Offline;
+        eng_off.active_language = Language::Thai;
+        for c in "discord".chars() {
+            assert!(eng_off.process_keystroke(c).is_none());
+        }
+        let r_discord = eng_off
+            .trigger_shift_backspace()
+            .expect("Expected Shift+Backspace on 'กรหแนพก'");
+        assert_eq!(r_discord.target_lang, Language::English);
+        assert_eq!(r_discord.replacement_text, "discord");
+        assert_eq!(r_discord.backspaces, 7);
+
+        let mut eng_func = make_test_engine();
+        eng_func.mode = CorrectionMode::Offline;
+        eng_func.active_language = Language::Thai;
+        for c in "func".chars() {
+            assert!(eng_func.process_keystroke(c).is_none());
+        }
+        let r_func = eng_func
+            .trigger_shift_backspace()
+            .expect("Expected Shift+Backspace on 'ดีืแ'");
+        assert_eq!(r_func.replacement_text, "func");
+        assert_eq!(r_func.backspaces, 4);
+
+        let mut eng_diff = make_test_engine();
+        eng_diff.mode = CorrectionMode::Offline;
+        eng_diff.active_language = Language::Thai;
+        for c in "diff".chars() {
+            assert!(eng_diff.process_keystroke(c).is_none());
+        }
+        let r_diff = eng_diff
+            .trigger_shift_backspace()
+            .expect("Expected Shift+Backspace on 'กรดด'");
+        assert_eq!(r_diff.replacement_text, "diff");
+        assert_eq!(r_diff.backspaces, 4);
+
+        let mut eng_sudo = make_test_engine();
+        eng_sudo.active_language = Language::Thai;
+        let (sudo_out, _) = simulate_app_typing(&mut eng_sudo, "sudo ");
+        assert_eq!(sudo_out, "sudo ");
+    }
+
+    #[test]
+    fn test_long_thai_midword_tail_in_not_reverted_at_space() {
+        let mut eng = make_test_engine();
+        eng.active_language = Language::English;
+        let (out, switches) = simulate_app_typing(&mut eng, "c]tg8]upiN ");
+        assert_eq!(out, "และเคลียร์ ");
+        assert_eq!(switches, 1);
+    }
+
+    #[test]
+    fn test_win11_notepad_and_word_leading_diacritic_backspaces() {
+        for proc_name in ["notepad.exe", "winword.exe"] {
+            let mut eng = make_test_engine();
+            eng.set_active_process(proc_name);
+            eng.active_language = Language::Thai;
+            let mut rep_hell = None;
+            for c in "hell".chars() {
+                if let Some(r) = eng.process_keystroke(c) {
+                    rep_hell = Some(r);
+                    break;
+                }
+            }
+            let r1 = rep_hell.expect("Expected switch on 'hell'");
+            assert_eq!(r1.replacement_text, "hell");
+            assert_eq!(r1.backspaces, 4);
+
+            eng.reset_all_buffers();
+            eng.active_language = Language::Thai;
+            let mut rep_user = None;
+            for c in "user".chars() {
+                if let Some(r) = eng.process_keystroke(c) {
+                    rep_user = Some(r);
+                    break;
+                }
+            }
+            let r2 = rep_user.expect("Expected switch on 'user'");
+            assert_eq!(r2.replacement_text, "user");
+            assert_eq!(r2.backspaces, 4);
+        }
+    }
+
+    #[test]
+    fn test_user_dict_garbage_filter_blocks_gaming_wasd_and_bad_thai() {
+        assert!(!is_sane_user_word_en("aaaa"));
+        assert!(!is_sane_user_word_en("wssssssssss"));
+        assert!(!is_sane_user_word_en("wsdwdd"));
+        assert!(!is_sane_user_word_en("daaaaaaaaaaaaaaaaaaawwraw"));
+        assert!(is_sane_user_word_en("discord"));
+        assert!(is_sane_user_word_en("chatgpt"));
+        assert!(is_sane_user_word_en("keyswitch"));
+
+        assert!(!is_sane_user_word_th("าำั"));
+        assert!(!is_sane_user_word_th("ๅชุด"));
+        assert!(!is_sane_user_word_th("ห๊าาาาาา"));
+        assert!(is_sane_user_word_th("เคลีย"));
+        assert!(is_sane_user_word_th("อัปเดต"));
+        assert!(is_sane_user_word_th("ศุภกฤต"));
+    }
+
+    #[test]
+    fn test_reconcile_replacement_queue_prevents_stranded_chars() {
+        let rep = PendingOsReplacement {
+            backspaces: 4,
+            target_lang: Language::English,
+            replacement_text: "disc".to_string(),
+        };
+
+        let p1 = reconcile_replacement_queue(&rep, &[DeferredKey::Printable('o')]);
+        assert!(!p1.aborted);
+        assert_eq!(p1.backspaces, 5);
+        assert_eq!(p1.base_text, "disc");
+        assert_eq!(p1.replay_keys, vec![DeferredKey::Printable('o')]);
+
+        let p2 = reconcile_replacement_queue(&rep, &[DeferredKey::Backspace]);
+        assert!(!p2.aborted);
+        assert_eq!(p2.backspaces, 3);
+        assert_eq!(p2.base_text, "dis");
+        assert!(p2.replay_keys.is_empty());
+
+        let p3 = reconcile_replacement_queue(
+            &rep,
+            &[DeferredKey::Printable('o'), DeferredKey::Backspace],
+        );
+        assert!(!p3.aborted);
+        assert_eq!(p3.backspaces, 4);
+        assert_eq!(p3.base_text, "disc");
+        assert!(p3.replay_keys.is_empty());
+
+        let p4 = reconcile_replacement_queue(&rep, &[DeferredKey::Boundary(' ')]);
+        assert!(!p4.aborted);
+        assert_eq!(p4.backspaces, 5);
+        assert_eq!(p4.base_text, "disc");
+        assert_eq!(p4.replay_keys, vec![DeferredKey::Boundary(' ')]);
+
+        let p5 = reconcile_replacement_queue(&rep, &[DeferredKey::Boundary('\n')]);
+        assert!(p5.aborted);
+    }
+
+    #[test]
+    fn test_modern_english_words_and_fast_evaluation_latency() {
+        for word in ["youtube ", "github ", "chatgpt ", "shopee ", "vscode "] {
+            let mut eng = make_test_engine();
+            eng.active_language = Language::Thai;
+            let (out, switches) = simulate_app_typing(&mut eng, word);
+            assert_eq!(out, word, "Failed auto-switch for '{word}'");
+            assert!(switches >= 1, "Expected switch for '{word}'");
+        }
+
+        let mut eng = make_test_engine();
+        let t0 = std::time::Instant::now();
+        let mut total_keys = 0usize;
+
+        eng.active_language = Language::Thai;
+        for c in "discord ".chars() {
+            let _ = eng.process_keystroke(c);
+            total_keys += 1;
+        }
+        eng.reset_all_buffers();
+        eng.active_language = Language::Thai;
+        for c in "สวัสดีครับวันนี้สบายดีไหม ".chars() {
+            let _ = eng.process_keystroke(c);
+            total_keys += 1;
+        }
+        eng.reset_all_buffers();
+        eng.active_language = Language::English;
+        for c in "c]tg8]upiN ".chars() {
+            let _ = eng.process_keystroke(c);
+            total_keys += 1;
+        }
+        eng.reset_all_buffers();
+        eng.active_language = Language::English;
+        for c in "discord ".chars() {
+            let _ = eng.process_keystroke(c);
+            total_keys += 1;
+        }
+
+        let elapsed = t0.elapsed();
+        let avg_ms = elapsed.as_secs_f64() * 1000.0 / (total_keys as f64);
+        assert!(
+            avg_ms < 5.0,
+            "Evaluation too slow: {avg_ms:.3} ms/key ({elapsed:?} for {total_keys} keys)"
+        );
     }
 }
