@@ -9,7 +9,7 @@ use engine::{
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -46,7 +46,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const WM_TRAYICON: u32 = WM_APP + 42;
 const WM_ENGINE_NOTIFY: u32 = WM_APP + 43;
 const TIMER_TOAST_FADE: usize = 102;
+const TIMER_TRAY_RETRY: usize = 103;
 const TRAY_ICON_UID: u32 = 9901;
+
+static WM_TASKBARCREATED: AtomicU32 = AtomicU32::new(0);
 
 const ICON_16_BGRA: &[u8] = include_bytes!("../assets/icon_16.bgra");
 const ICON_24_BGRA: &[u8] = include_bytes!("../assets/icon_24.bgra");
@@ -345,7 +348,12 @@ fn write_keyswitch_ico_file(path: &Path) {
     let _ = std::fs::write(path, ico);
 }
 
-unsafe fn add_or_update_tray_icon(hwnd: HWND, mode: CorrectionMode, thai_ui: bool, is_add: bool) {
+unsafe fn add_or_update_tray_icon(
+    hwnd: HWND,
+    mode: CorrectionMode,
+    thai_ui: bool,
+    is_add: bool,
+) -> bool {
     let icon_sz = GetSystemMetrics(SM_CXSMICON).max(16);
     let h_icon = create_keyswitch_hicon(icon_sz, mode);
     let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
@@ -362,15 +370,21 @@ unsafe fn add_or_update_tray_icon(hwnd: HWND, mode: CorrectionMode, thai_ui: boo
         nid.szTip[i] = ch;
     }
 
-    if is_add {
+    let ok = if is_add {
         Shell_NotifyIconW(NIM_DELETE, &mut nid);
-        Shell_NotifyIconW(NIM_ADD, &mut nid);
+        Shell_NotifyIconW(NIM_ADD, &mut nid) != 0
     } else {
-        Shell_NotifyIconW(NIM_MODIFY, &mut nid);
-    }
+        let m = Shell_NotifyIconW(NIM_MODIFY, &mut nid) != 0;
+        if !m {
+            Shell_NotifyIconW(NIM_ADD, &mut nid) != 0
+        } else {
+            true
+        }
+    };
     if !h_icon.is_null() {
         DestroyIcon(h_icon);
     }
+    ok
 }
 
 unsafe fn remove_tray_icon(hwnd: HWND) {
@@ -2099,12 +2113,50 @@ unsafe extern "system" fn main_wnd_proc(
             EndPaint(hwnd, &ps);
             0
         }
+        WM_TIMER if w_param == TIMER_TRAY_RETRY => {
+            let snap = {
+                GLOBAL_APP_STATE.lock().ok().and_then(|g| {
+                    g.as_ref().and_then(|arc| {
+                        arc.lock()
+                            .ok()
+                            .map(|st| (st.engine.mode, st.engine.thai_ui, st.is_installer_process))
+                    })
+                })
+            };
+            if let Some((mode, th, is_inst)) = snap {
+                if is_inst || add_or_update_tray_icon(hwnd, mode, th, true) {
+                    KillTimer(hwnd, TIMER_TRAY_RETRY);
+                }
+            }
+            0
+        }
         WM_DESTROY => {
+            KillTimer(hwnd, TIMER_TRAY_RETRY);
             remove_tray_icon(hwnd);
             PostQuitMessage(0);
             0
         }
-        _ => DefWindowProcW(hwnd, msg, w_param, l_param),
+        _ => {
+            let tbc = WM_TASKBARCREATED.load(Ordering::Relaxed);
+            if tbc != 0 && msg == tbc {
+                let snap = {
+                    GLOBAL_APP_STATE.lock().ok().and_then(|g| {
+                        g.as_ref().and_then(|arc| {
+                            arc.lock().ok().map(|st| {
+                                (st.engine.mode, st.engine.thai_ui, st.is_installer_process)
+                            })
+                        })
+                    })
+                };
+                if let Some((mode, th, is_inst)) = snap {
+                    if !is_inst && !add_or_update_tray_icon(hwnd, mode, th, true) {
+                        SetTimer(hwnd, TIMER_TRAY_RETRY, 1000, None);
+                    }
+                }
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, w_param, l_param)
+        }
     }
 }
 
@@ -2736,36 +2788,116 @@ unsafe extern "system" fn low_level_kbd_proc(
     CallNextHookEx(null_mut(), n_code, w_param, l_param)
 }
 
-fn apply_windows_autostart_registry(enable: bool) {
-    if let Ok(exe_path) = std::env::current_exe() {
-        let exe_str = exe_path.to_string_lossy().to_string();
-        if enable {
-            let _ = std::process::Command::new("reg")
-                .args([
-                    "add",
-                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                    "/v",
-                    "KeySwitch",
-                    "/t",
-                    "REG_SZ",
-                    "/d",
-                    &format!("\"{exe_str}\""),
-                    "/f",
-                ])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
-        } else {
-            let _ = std::process::Command::new("reg")
-                .args([
-                    "delete",
-                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                    "/v",
-                    "KeySwitch",
-                    "/f",
-                ])
+fn startup_shortcut_path() -> Option<PathBuf> {
+    std::env::var("APPDATA").ok().map(|ad| {
+        PathBuf::from(ad)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Startup")
+            .join("KeySwitch.lnk")
+    })
+}
+
+fn is_windows_autostart_enabled() -> bool {
+    if let Some(p) = startup_shortcut_path() {
+        if p.exists() {
+            return true;
+        }
+    }
+    if let Ok(out) = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            "KeySwitch",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        return out.status.success();
+    }
+    false
+}
+
+fn apply_windows_autostart_for_exe(exe_path: &Path, enable: bool) {
+    let exe_str = exe_path.to_string_lossy().to_string();
+    let work_dir = exe_path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ico_path = exe_path
+        .parent()
+        .map(|p| p.join("keyswitch_v2.ico").to_string_lossy().to_string())
+        .unwrap_or_else(|| exe_str.clone());
+
+    if enable {
+        let _ = std::process::Command::new("reg")
+            .args([
+                "add",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "KeySwitch",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &format!("\"{exe_str}\" --autostart"),
+                "/f",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let _ = std::process::Command::new("reg")
+            .args([
+                "add",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+                "/v",
+                "KeySwitch",
+                "/t",
+                "REG_BINARY",
+                "/d",
+                "020000000000000000000000",
+                "/f",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        if let Some(lnk) = startup_shortcut_path() {
+            let lnk_str = lnk.to_string_lossy().to_string();
+            let ps = format!(
+                "$ws = New-Object -ComObject WScript.Shell; \
+                 $s = $ws.CreateShortcut('{lnk_str}'); \
+                 $s.TargetPath = '{exe_str}'; \
+                 $s.Arguments = '--autostart'; \
+                 $s.IconLocation = '{ico_path},0'; \
+                 $s.WorkingDirectory = '{work_dir}'; \
+                 $s.Description = 'KeySwitch — Thai/English Keyboard Auto-Switcher'; \
+                 $s.Save()"
+            );
+            let _ = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output();
         }
+    } else {
+        let _ = std::process::Command::new("reg")
+            .args([
+                "delete",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "KeySwitch",
+                "/f",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        if let Some(lnk) = startup_shortcut_path() {
+            let _ = std::fs::remove_file(lnk);
+        }
+    }
+}
+
+fn apply_windows_autostart_registry(enable: bool) {
+    if let Ok(exe_path) = std::env::current_exe() {
+        apply_windows_autostart_for_exe(&exe_path, enable);
     }
 }
 
@@ -2802,22 +2934,7 @@ fn perform_self_install_custom(
     let target_str = target_exe.to_string_lossy().to_string();
     let ico_str = ico_file.to_string_lossy().to_string();
 
-    if enable_autostart {
-        let _ = std::process::Command::new("reg")
-            .args([
-                "add",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                "KeySwitch",
-                "/t",
-                "REG_SZ",
-                "/d",
-                &format!("\"{target_str}\""),
-                "/f",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-    }
+    apply_windows_autostart_for_exe(&target_exe, enable_autostart);
 
     let uninst_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\KeySwitch";
     let _ = std::process::Command::new("reg")
@@ -2896,11 +3013,12 @@ fn perform_self_install_custom(
     Ok(target_exe)
 }
 
-fn parse_args() -> (bool, bool, bool) {
+fn parse_args() -> (bool, bool, bool, bool) {
     let args: Vec<String> = std::env::args().collect();
     let mut silent_install = false;
     let mut wizard_install = false;
     let mut uninstall_mode = false;
+    let mut autostart_launch = false;
     for arg in args.iter().skip(1) {
         if arg == "--install" || arg == "/install" || arg == "/S" {
             silent_install = true;
@@ -2908,6 +3026,8 @@ fn parse_args() -> (bool, bool, bool) {
             wizard_install = true;
         } else if arg == "--uninstall" {
             uninstall_mode = true;
+        } else if arg == "--autostart" {
+            autostart_launch = true;
         }
     }
     if !uninstall_mode && !silent_install {
@@ -2919,7 +3039,7 @@ fn parse_args() -> (bool, bool, bool) {
             }
         }
     }
-    (silent_install, wizard_install, uninstall_mode)
+    (silent_install, wizard_install, uninstall_mode, autostart_launch)
 }
 
 fn main() {
@@ -2927,7 +3047,7 @@ fn main() {
         SetProcessDPIAware();
     }
 
-    let (silent_install, wizard_install, uninstall_mode) = parse_args();
+    let (silent_install, wizard_install, uninstall_mode, autostart_launch) = parse_args();
 
     if uninstall_mode {
         apply_windows_autostart_registry(false);
@@ -2952,10 +3072,12 @@ fn main() {
             let mutex_name = to_wstring("Local\\KeySwitch_SingleInstance_Mutex_v2");
             let h_mutex = winapi::um::synchapi::CreateMutexW(null_mut(), 0, mutex_name.as_ptr());
             if winapi::um::errhandlingapi::GetLastError() == 183 {
-                let cls = to_wstring("KeySwitchNativeMainWnd");
-                let existing = FindWindowW(cls.as_ptr(), null_mut());
-                if !existing.is_null() {
-                    PostMessageW(existing, WM_COMMAND, CMD_OPEN_CONFIG, 0);
+                if !autostart_launch {
+                    let cls = to_wstring("KeySwitchNativeMainWnd");
+                    let existing = FindWindowW(cls.as_ptr(), null_mut());
+                    if !existing.is_null() {
+                        PostMessageW(existing, WM_COMMAND, CMD_OPEN_CONFIG, 0);
+                    }
                 }
                 if !h_mutex.is_null() {
                     winapi::um::handleapi::CloseHandle(h_mutex);
@@ -2968,7 +3090,8 @@ fn main() {
         null_mut()
     };
 
-    let engine = RightLangEngine::new();
+    let mut engine = RightLangEngine::new();
+    engine.auto_start = is_windows_autostart_enabled();
     sync_active_shortcut_atomics(&engine);
     let initial_thai_ui = engine.thai_ui;
     let initial_mode = engine.mode;
@@ -3089,7 +3212,11 @@ fn main() {
         }
 
         if !wizard_install {
-            add_or_update_tray_icon(hwnd, initial_mode, initial_thai_ui, true);
+            let tbc = RegisterWindowMessageW(to_wstring("TaskbarCreated").as_ptr());
+            WM_TASKBARCREATED.store(tbc, Ordering::Relaxed);
+            if !add_or_update_tray_icon(hwnd, initial_mode, initial_thai_ui, true) {
+                SetTimer(hwnd, TIMER_TRAY_RETRY, 1000, None);
+            }
             start_keyboard_worker_and_hook(Arc::clone(&app_state));
         }
 
