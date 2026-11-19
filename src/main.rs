@@ -197,13 +197,8 @@ fn view_dimensions(view: ActiveView) -> (i32, i32) {
     }
 }
 
-fn view_title(view: ActiveView, th: bool) -> &'static str {
-    match (view, th) {
-        (ActiveView::InstallerWizard, true) => "KeySwitch 2.0 Setup Wizard",
-        (ActiveView::InstallerWizard, false) => "KeySwitch 2.0 Setup Wizard",
-        (ActiveView::ConfigForm, true) => "KeySwitch — ตั้งค่า",
-        (ActiveView::ConfigForm, false) => "KeySwitch — Settings",
-    }
+fn view_title() -> &'static str {
+    APP_BRAND_NAME
 }
 
 fn center_screen_pos(win_w: i32, win_h: i32) -> (i32, i32) {
@@ -351,7 +346,6 @@ fn write_keyswitch_ico_file(path: &Path) {
 unsafe fn add_or_update_tray_icon(
     hwnd: HWND,
     mode: CorrectionMode,
-    thai_ui: bool,
     is_add: bool,
 ) -> bool {
     let icon_sz = GetSystemMetrics(SM_CXSMICON).max(16);
@@ -364,7 +358,7 @@ unsafe fn add_or_update_tray_icon(
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = h_icon;
 
-    let tip_str = format!("{} — {}\0", APP_BRAND_NAME, mode.label(thai_ui));
+    let tip_str = format!("{}\0", APP_BRAND_NAME);
     let tip: Vec<u16> = tip_str.encode_utf16().collect();
     for (i, &ch) in tip.iter().take(nid.szTip.len() - 1).enumerate() {
         nid.szTip[i] = ch;
@@ -535,7 +529,7 @@ unsafe fn open_dialog_view_safe(hwnd: HWND, view: ActiveView) {
         let (cw, ch) = view_dimensions(view);
         st.win_w = cw;
         st.win_h = ch;
-        let t = view_title(view, st.engine.thai_ui);
+        let t = view_title();
         (cw, ch, t)
     };
 
@@ -1581,7 +1575,7 @@ unsafe fn handle_dialog_action_safe(hwnd: HWND, action_id: u32) {
         None,
         Repaint,
         CloseDialog,
-        UpdateTrayAndTitle(CorrectionMode, bool, &'static str, bool),
+        UpdateTrayAndTitle(CorrectionMode, &'static str, bool),
         Quit,
     }
 
@@ -1672,8 +1666,7 @@ unsafe fn handle_dialog_action_safe(hwnd: HWND, action_id: u32) {
                 });
                 PostAction::UpdateTrayAndTitle(
                     st.engine.mode,
-                    st.engine.thai_ui,
-                    view_title(st.active_view, st.engine.thai_ui),
+                    view_title(),
                     false,
                 )
             }
@@ -1684,8 +1677,7 @@ unsafe fn handle_dialog_action_safe(hwnd: HWND, action_id: u32) {
                 st.status_banner = None;
                 PostAction::UpdateTrayAndTitle(
                     st.engine.mode,
-                    st.engine.thai_ui,
-                    view_title(st.active_view, st.engine.thai_ui),
+                    view_title(),
                     true,
                 )
             }
@@ -1699,9 +1691,9 @@ unsafe fn handle_dialog_action_safe(hwnd: HWND, action_id: u32) {
             InvalidateRect(hwnd, null_mut(), 1);
         }
         PostAction::CloseDialog => close_dialog_to_tray_safe(hwnd),
-        PostAction::UpdateTrayAndTitle(mode, th, title, close_after) => {
+        PostAction::UpdateTrayAndTitle(mode, title, close_after) => {
             SetWindowTextW(hwnd, to_wstring(title).as_ptr());
-            add_or_update_tray_icon(hwnd, mode, th, false);
+            add_or_update_tray_icon(hwnd, mode, false);
             if close_after {
                 close_dialog_to_tray_safe(hwnd);
             } else {
@@ -1936,19 +1928,14 @@ unsafe extern "system" fn main_wnd_proc(
                         CMD_MODE_OFFLINE => CorrectionMode::Offline,
                         _ => CorrectionMode::Disabled,
                     };
-                    let th = {
-                        let mut thai = true;
-                        if let Ok(guard) = GLOBAL_APP_STATE.lock() {
-                            if let Some(arc) = guard.as_ref() {
-                                if let Ok(mut st) = arc.lock() {
-                                    st.engine.mode = new_mode;
-                                    thai = st.engine.thai_ui;
-                                }
+                    if let Ok(guard) = GLOBAL_APP_STATE.lock() {
+                        if let Some(arc) = guard.as_ref() {
+                            if let Ok(mut st) = arc.lock() {
+                                st.engine.mode = new_mode;
                             }
                         }
-                        thai
-                    };
-                    add_or_update_tray_icon(hwnd, new_mode, th, false);
+                    }
+                    add_or_update_tray_icon(hwnd, new_mode, false);
                 }
                 CMD_TOGGLE_AUTOSTART => {
                     let new_as = {
@@ -1973,17 +1960,13 @@ unsafe extern "system" fn main_wnd_proc(
                                     st.engine.thai_ui = !st.engine.thai_ui;
                                     st.draft.thai_ui = st.engine.thai_ui;
                                     let _ = st.engine.save_all_user_settings();
-                                    (
-                                        st.engine.mode,
-                                        st.engine.thai_ui,
-                                        view_title(st.active_view, st.engine.thai_ui),
-                                    )
+                                    (st.engine.mode, view_title())
                                 })
                             })
                         })
                     };
-                    if let Some((mode, th, title)) = snap {
-                        add_or_update_tray_icon(hwnd, mode, th, false);
+                    if let Some((mode, title)) = snap {
+                        add_or_update_tray_icon(hwnd, mode, false);
                         SetWindowTextW(hwnd, to_wstring(title).as_ptr());
                         InvalidateRect(hwnd, null_mut(), 1);
                     }
@@ -2008,15 +1991,14 @@ unsafe extern "system" fn main_wnd_proc(
                         arc.lock().ok().map(|st| {
                             (
                                 st.engine.mode,
-                                st.engine.thai_ui,
                                 st.engine.notification.as_ref().map(|n| n.opacity),
                             )
                         })
                     })
                 })
             };
-            if let Some((mode, th, opacity_opt)) = snap {
-                add_or_update_tray_icon(hwnd, mode, th, false);
+            if let Some((mode, opacity_opt)) = snap {
+                add_or_update_tray_icon(hwnd, mode, false);
                 if let Some(op) = opacity_opt {
                     if let Ok(t_slot) = TOAST_HWND.lock() {
                         if *t_slot != 0 {
@@ -2119,12 +2101,12 @@ unsafe extern "system" fn main_wnd_proc(
                     g.as_ref().and_then(|arc| {
                         arc.lock()
                             .ok()
-                            .map(|st| (st.engine.mode, st.engine.thai_ui, st.is_installer_process))
+                            .map(|st| (st.engine.mode, st.is_installer_process))
                     })
                 })
             };
-            if let Some((mode, th, is_inst)) = snap {
-                if is_inst || add_or_update_tray_icon(hwnd, mode, th, true) {
+            if let Some((mode, is_inst)) = snap {
+                if is_inst || add_or_update_tray_icon(hwnd, mode, true) {
                     KillTimer(hwnd, TIMER_TRAY_RETRY);
                 }
             }
@@ -2141,15 +2123,12 @@ unsafe extern "system" fn main_wnd_proc(
             if tbc != 0 && msg == tbc {
                 let snap = {
                     GLOBAL_APP_STATE.lock().ok().and_then(|g| {
-                        g.as_ref().and_then(|arc| {
-                            arc.lock().ok().map(|st| {
-                                (st.engine.mode, st.engine.thai_ui, st.is_installer_process)
-                            })
-                        })
+                        g.as_ref()
+                            .and_then(|arc| arc.lock().ok().map(|st| (st.engine.mode, st.is_installer_process)))
                     })
                 };
-                if let Some((mode, th, is_inst)) = snap {
-                    if !is_inst && !add_or_update_tray_icon(hwnd, mode, th, true) {
+                if let Some((mode, is_inst)) = snap {
+                    if !is_inst && !add_or_update_tray_icon(hwnd, mode, true) {
                         SetTimer(hwnd, TIMER_TRAY_RETRY, 1000, None);
                     }
                 }
@@ -2469,20 +2448,26 @@ unsafe fn execute_switch_selected_text(hwnd: HWND, state_arc: &Arc<Mutex<AppUiSt
 
     let seq_before = GetClipboardSequenceNumber();
 
-    let mut copy_inputs: [INPUT; 5] = std::mem::zeroed();
+    let mut copy_inputs: [INPUT; 7] = std::mem::zeroed();
     copy_inputs[0].type_ = INPUT_KEYBOARD;
-    copy_inputs[0].u.ki_mut().wVk = VK_SHIFT as u16;
+    copy_inputs[0].u.ki_mut().wVk = VK_LSHIFT as u16;
     copy_inputs[0].u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
     copy_inputs[1].type_ = INPUT_KEYBOARD;
-    copy_inputs[1].u.ki_mut().wVk = VK_CONTROL as u16;
+    copy_inputs[1].u.ki_mut().wVk = VK_RSHIFT as u16;
+    copy_inputs[1].u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
     copy_inputs[2].type_ = INPUT_KEYBOARD;
-    copy_inputs[2].u.ki_mut().wVk = b'C' as u16;
+    copy_inputs[2].u.ki_mut().wVk = VK_SHIFT as u16;
+    copy_inputs[2].u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
     copy_inputs[3].type_ = INPUT_KEYBOARD;
-    copy_inputs[3].u.ki_mut().wVk = b'C' as u16;
-    copy_inputs[3].u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
+    copy_inputs[3].u.ki_mut().wVk = VK_CONTROL as u16;
     copy_inputs[4].type_ = INPUT_KEYBOARD;
-    copy_inputs[4].u.ki_mut().wVk = VK_CONTROL as u16;
-    copy_inputs[4].u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
+    copy_inputs[4].u.ki_mut().wVk = b'C' as u16;
+    copy_inputs[5].type_ = INPUT_KEYBOARD;
+    copy_inputs[5].u.ki_mut().wVk = b'C' as u16;
+    copy_inputs[5].u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
+    copy_inputs[6].type_ = INPUT_KEYBOARD;
+    copy_inputs[6].u.ki_mut().wVk = VK_CONTROL as u16;
+    copy_inputs[6].u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
 
     SendInput(
         copy_inputs.len() as u32,
@@ -2579,23 +2564,33 @@ fn start_keyboard_worker_and_hook(state_arc: Arc<Mutex<AppUiState>>) {
     let worker_state = Arc::clone(&state_arc);
     std::thread::spawn(move || unsafe {
         let mut last_fg: usize = 0;
+        let mut last_proc_name = String::new();
         let mut last_switch_at: Option<(Instant, Language)> = None;
 
         while let Ok(ev) = rx.recv() {
             match ev {
                 HookEvent::PrintableKey { us_char, hwnd } => {
                     let fg = hwnd as HWND;
-                    let proc_name = query_foreground_process_name(fg);
+                    if hwnd != last_fg {
+                        last_proc_name = query_foreground_process_name(fg);
+                    }
                     let os_lang = match last_switch_at {
-                        Some((t, lang)) if t.elapsed().as_millis() < 120 => lang,
+                        Some((t, lang)) if hwnd == last_fg && t.elapsed().as_millis() < 120 => {
+                            lang
+                        }
                         _ => detect_window_input_language(fg),
                     };
                     let rep_opt = if let Ok(mut st) = worker_state.lock() {
                         if hwnd != last_fg {
-                            st.engine.clear_buffers();
+                            st.engine.reset_all_buffers();
                             last_fg = hwnd;
+                            st.engine.set_active_process(&last_proc_name);
                         }
-                        st.engine.set_active_process(&proc_name);
+                        if !st.engine.eng_filter.buffer.is_empty()
+                            && st.engine.active_language != os_lang
+                        {
+                            st.engine.clear_current_word();
+                        }
                         st.engine.active_language = os_lang;
                         st.engine.process_keystroke(us_char)
                     } else {
@@ -2615,7 +2610,15 @@ fn start_keyboard_worker_and_hook(state_arc: Arc<Mutex<AppUiState>>) {
                 HookEvent::Boundary { ch, hwnd } => {
                     let fg = hwnd as HWND;
                     let rep_opt = if let Ok(mut st) = worker_state.lock() {
-                        st.engine.process_keystroke(ch)
+                        if hwnd != last_fg {
+                            st.engine.reset_all_buffers();
+                            last_fg = hwnd;
+                            last_proc_name = query_foreground_process_name(fg);
+                            st.engine.set_active_process(&last_proc_name);
+                            None
+                        } else {
+                            st.engine.process_keystroke(ch)
+                        }
                     } else {
                         None
                     };
@@ -2637,13 +2640,21 @@ fn start_keyboard_worker_and_hook(state_arc: Arc<Mutex<AppUiState>>) {
                 }
                 HookEvent::ClearBuffer => {
                     if let Ok(mut st) = worker_state.lock() {
-                        st.engine.clear_buffers();
+                        st.engine.reset_all_buffers();
                     }
                 }
                 HookEvent::SwitchBufferShortcut { hwnd } => {
                     let fg = hwnd as HWND;
                     let rep_opt = if let Ok(mut st) = worker_state.lock() {
-                        st.engine.trigger_shift_backspace()
+                        if hwnd != last_fg {
+                            st.engine.reset_all_buffers();
+                            last_fg = hwnd;
+                            last_proc_name = query_foreground_process_name(fg);
+                            st.engine.set_active_process(&last_proc_name);
+                            None
+                        } else {
+                            st.engine.trigger_shift_backspace()
+                        }
                     } else {
                         None
                     };
@@ -2702,6 +2713,8 @@ unsafe extern "system" fn low_level_kbd_proc(
             let shift_down = (GetAsyncKeyState(VK_SHIFT) as u16 & 0x8000) != 0;
             let ctrl_down = (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0;
             let alt_down = (GetAsyncKeyState(VK_MENU) as u16 & 0x8000) != 0;
+            let win_down = (GetAsyncKeyState(VK_LWIN) as u16 & 0x8000) != 0
+                || (GetAsyncKeyState(VK_RWIN) as u16 & 0x8000) != 0;
             let caps_on = (GetKeyState(VK_CAPITAL) & 1) != 0;
             let vk = kb.vkCode;
             let fg_hwnd = GetForegroundWindow() as usize;
@@ -2746,7 +2759,7 @@ unsafe extern "system" fn low_level_kbd_proc(
                         }
                     }
 
-                    if ctrl_down || alt_down {
+                    if win_down || ctrl_down || alt_down {
                         let _ = tx.send(HookEvent::ClearBuffer);
                     } else if vk == VK_OEM_3 as u32 && !shift_down && read_windows_lang_hotkey() == 4
                     {
@@ -2945,7 +2958,7 @@ fn perform_self_install_custom(
 
     let uninst_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\KeySwitch";
     let _ = std::process::Command::new("reg")
-        .args(["add", uninst_key, "/v", "DisplayName", "/d", "KeySwitch 2.0", "/f"])
+        .args(["add", uninst_key, "/v", "DisplayName", "/d", APP_BRAND_NAME, "/f"])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     let _ = std::process::Command::new("reg")
@@ -3100,7 +3113,6 @@ fn main() {
     let mut engine = RightLangEngine::new();
     engine.auto_start = is_windows_autostart_enabled();
     sync_active_shortcut_atomics(&engine);
-    let initial_thai_ui = engine.thai_ui;
     let initial_mode = engine.mode;
     let draft = ConfigDraft::from_engine(&engine);
     let initial_view = if wizard_install {
@@ -3177,7 +3189,7 @@ fn main() {
         let outer_h = rc.bottom - rc.top;
         let (pos_x, pos_y) = center_screen_pos(outer_w, outer_h);
 
-        let title_str = view_title(initial_view, initial_thai_ui);
+        let title_str = view_title();
         let hwnd = CreateWindowExW(
             0,
             main_cls.as_ptr(),
@@ -3219,9 +3231,10 @@ fn main() {
         }
 
         if !wizard_install {
+            let _ = read_windows_lang_hotkey();
             let tbc = RegisterWindowMessageW(to_wstring("TaskbarCreated").as_ptr());
             WM_TASKBARCREATED.store(tbc, Ordering::Relaxed);
-            if !add_or_update_tray_icon(hwnd, initial_mode, initial_thai_ui, true) {
+            if !add_or_update_tray_icon(hwnd, initial_mode, true) {
                 SetTimer(hwnd, TIMER_TRAY_RETRY, 1000, None);
             }
             start_keyboard_worker_and_hook(Arc::clone(&app_state));
