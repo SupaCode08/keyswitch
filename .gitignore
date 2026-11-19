@@ -1,0 +1,11 @@
+/target/
+/shots/
+*.exe
+keyswitch.ico
+mechanics.json
+MECHANICS.md
+assets/icon_master.png
+data/applist.txt
+data/config.txt
+dict/prefix.en.txt
+dict/prefix.th.txt

@@ -1,0 +1,37 @@
+[package]
+name = "rightlang"
+version = "2.0.0"
+edition = "2021"
+description = "SupaType (Rust Edition) — Ultra-Fast Thai/English Keyboard Auto-Switcher & Layout Corrector"
+
+[dependencies]
+winapi = { version = "0.3.9", features = [
+    "winuser",
+    "shellapi",
+    "wingdi",
+    "libloaderapi",
+    "processthreadsapi",
+    "psapi",
+    "winbase",
+    "winreg",
+    "minwindef",
+    "windef",
+    "winnt",
+    "handleapi",
+    "synchapi",
+    "sysinfoapi",
+    "errhandlingapi",
+] }
+
+[profile.dev]
+opt-level = 3
+debug = false
+strip = true
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
