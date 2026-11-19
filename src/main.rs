@@ -2373,8 +2373,15 @@ unsafe fn execute_os_replacement(hwnd: HWND, rep: &PendingOsReplacement) {
 
     std::thread::sleep(std::time::Duration::from_millis(15));
 
-    let mut inputs: Vec<INPUT> = Vec::with_capacity(rep.backspaces * 2 + 4);
-    for vk_mod in [VK_SHIFT, VK_CONTROL] {
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(rep.backspaces * 2 + 8);
+    for vk_mod in [
+        VK_LSHIFT,
+        VK_RSHIFT,
+        VK_SHIFT,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_CONTROL,
+    ] {
         if (GetAsyncKeyState(vk_mod) as u16 & 0x8000) != 0 {
             let mut up: INPUT = std::mem::zeroed();
             up.type_ = INPUT_KEYBOARD;
@@ -2705,10 +2712,6 @@ unsafe extern "system" fn low_level_kbd_proc(
 
             if let Ok(guard) = HOOK_SENDER.lock() {
                 if let Some(tx) = guard.as_ref() {
-                    if mouse_clicked {
-                        let _ = tx.send(HookEvent::ClearBuffer);
-                    }
-
                     if ctrl_down && !shift_down && !alt_down && vk == VK_CAPITAL as u32 {
                         let _ = tx.send(HookEvent::ToggleMode);
                         return 1;
@@ -2731,6 +2734,10 @@ unsafe extern "system" fn low_level_kbd_proc(
                     if hit_sel {
                         let _ = tx.send(HookEvent::SwitchSelectedShortcut { hwnd: fg_hwnd });
                         return 1;
+                    }
+
+                    if mouse_clicked {
+                        let _ = tx.send(HookEvent::ClearBuffer);
                     }
 
                     if let Ok(m_slot) = MAIN_HWND.lock() {
